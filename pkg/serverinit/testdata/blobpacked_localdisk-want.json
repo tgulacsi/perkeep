@@ -65,6 +65,9 @@
 				"path": "/tmp/blobs/cache"
 			}
 		},
+		"/dav/": {
+			"handler": "dav"
+		},
 		"/help/": {
 			"handler": "help"
 		},

@@ -271,7 +271,7 @@ func exitFailure(pattern string, args ...interface{}) {
 	if !strings.HasSuffix(pattern, "\n") {
 		pattern = pattern + "\n"
 	}
-	panic(fmt.Sprintf(pattern, args...))
+	panic(fmt.Errorf(pattern, args...))
 }
 
 func (hl *handlerLoader) setupHandler(prefix string) {
@@ -366,7 +366,7 @@ func (hl *handlerLoader) setupHandler(prefix string) {
 		var err error
 		hh, err = blobserver.CreateHandler(h.htype, hl, h.conf)
 		if err != nil {
-			exitFailure("error instantiating handler for prefix %q, type %q: %v",
+			exitFailure("error instantiating handler for prefix %q, type %q: %w",
 				h.prefix, h.htype, err)
 		}
 	}
@@ -394,7 +394,7 @@ func handlerTypeWantsAuth(handlerType string) bool {
 	// TODO(bradfitz): ask the handler instead? This is a bit of a
 	// weird spot for this policy maybe?
 	switch handlerType {
-	case "ui", "search", "jsonsign", "sync", "status", "help", "importer":
+	case "ui", "search", "jsonsign", "sync", "status", "help", "importer", "dav":
 		return true
 	}
 	return false

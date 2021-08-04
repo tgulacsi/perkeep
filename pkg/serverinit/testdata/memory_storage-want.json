@@ -42,6 +42,9 @@
 		"/cache/": {
 			"handler": "storage-memory"
 		},
+		"/dav/": {
+			"handler": "dav"
+		},
 		"/help/": {
 			"handler": "help"
 		},

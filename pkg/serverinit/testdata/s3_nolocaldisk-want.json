@@ -49,6 +49,9 @@
 				"path": "/tmp/camli-cache"
 			}
 		},
+		"/dav/": {
+			"handler": "dav"
+		},
 		"/help/": {
 			"handler": "help"
 		},

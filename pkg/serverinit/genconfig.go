@@ -1191,6 +1191,8 @@ func (b *lowBuilder) build() (*Config, error) {
 			"blobSource": "/bs/",
 			"storage":    sto,
 		})
+
+		b.addPrefix("/dav/", "dav", nil)
 	}
 
 	if conf.S3 != "" {

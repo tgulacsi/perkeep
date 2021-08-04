@@ -64,6 +64,9 @@
 				"path": "/path/to/blobs/cache"
 			}
 		},
+		"/dav/": {
+			"handler": "dav"
+		},
 		"/help/": {
 			"handler": "help"
 		},
@@ -166,6 +169,17 @@
 				"bucket": "gcsBucketName/blobs/packed"
 			}
 		},
+		"/sto-googlecloudstorage/": {
+			"handler": "storage-blobpacked",
+			"handlerArgs": {
+				"largeBlobs": "/sto-googlecloudstorage-bs-packed/",
+				"metaIndex": {
+					"file": "/path/to/packindex.kv",
+					"type": "kv"
+				},
+				"smallBlobs": "/sto-googlecloudstorage-bs-loose/"
+			}
+		},
 		"/sto-s3-bs-loose/": {
 			"handler": "storage-s3",
 			"handlerArgs": {
@@ -191,17 +205,6 @@
 					"type": "kv"
 				},
 				"smallBlobs": "/sto-s3-bs-loose/"
-			}
-		},
-		"/sto-googlecloudstorage/": {
-			"handler": "storage-blobpacked",
-			"handlerArgs": {
-				"largeBlobs": "/sto-googlecloudstorage-bs-packed/",
-				"metaIndex": {
-					"file": "/path/to/packindex.kv",
-					"type": "kv"
-				},
-				"smallBlobs": "/sto-googlecloudstorage-bs-loose/"
 			}
 		},
 		"/sync-to-b2/": {
