@@ -47,6 +47,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
@@ -89,11 +90,12 @@ type storage struct {
 
 	*local.Generationer
 
-	mu     sync.Mutex // Guards all I/O state.
-	closed bool
-	writer *os.File
-	fds    []*os.File
-	size   int64
+	mu             sync.Mutex // Guards all I/O state.
+	closed         bool
+	writer         *os.File
+	writerLastSync time.Time
+	fds            []*os.File
+	size           int64
 }
 
 func (s *storage) String() string {
@@ -703,8 +705,11 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	if n2 != int64(br.Size) {
 		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
 	}
-	if err = s.writer.Sync(); err != nil {
-		return err
+	if now := time.Now(); s.writerLastSync.Before(now.Add(time.Second)) {
+		if err = s.writer.Sync(); err != nil {
+			return err
+		}
+		s.writerLastSync = now
 	}
 
 	packIdx := len(s.fds) - 1
