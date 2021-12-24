@@ -237,6 +237,16 @@ func actualBinDir() string {
 	return filepath.Dir(strings.TrimSpace(string(out)))
 }
 
+func baseDirName(sql bool) string {
+	buildBaseDir := "build-gopath"
+	// We don't even consider whether we're cross-compiling. As long as we
+	// build for ARM, we do it in its own versioned dir.
+	if *buildARCH == "arm" {
+		buildBaseDir += "-armv" + *buildARM
+	}
+	return buildBaseDir
+}
+
 const (
 	publisherJS    = "app/publisher/publisher.js"
 	publisherJSURL = "https://storage.googleapis.com/perkeep-release/gopherjs/publisher.js"
