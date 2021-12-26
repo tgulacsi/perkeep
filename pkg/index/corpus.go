@@ -37,6 +37,7 @@ import (
 	"perkeep.org/pkg/sorted"
 	"perkeep.org/pkg/types/camtypes"
 
+	"go4.org/intern"
 	"go4.org/strutil"
 	"go4.org/syncutil"
 )
@@ -60,7 +61,6 @@ type Corpus struct {
 	// It's used as a query cache invalidator.
 	gen int64
 
-	strs      map[string]string   // interned strings
 	brOfStr   map[string]blob.Ref // blob.Parse fast path
 	brInterns int64               // blob.Ref -> blob.Ref, via br method
 
@@ -919,14 +919,7 @@ func (c *Corpus) str(s string) string {
 	if s == "" {
 		return ""
 	}
-	if s, ok := c.strs[s]; ok {
-		return s
-	}
-	if c.strs == nil {
-		c.strs = make(map[string]string)
-	}
-	c.strs[s] = s
-	return s
+	return intern.GetByString(s).Get().(string)
 }
 
 // br returns br, interned.
