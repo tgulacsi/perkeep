@@ -77,7 +77,7 @@ type Corpus struct {
 	// signerRefs maps a signer GPG ID to all its signer blobs (because different hashes).
 	signerRefs   map[string]SignerRefSet
 	files        map[blob.Ref]camtypes.FileInfo // keyed by file or directory schema blob
-	permanodes   map[blob.Ref]*PermanodeMeta
+	permanodes   permanodeCache
 	imageInfo    map[blob.Ref]camtypes.ImageInfo // keyed by fileref (not wholeref)
 	fileWholeRef map[blob.Ref]blob.Ref           // fileref -> its wholeref (TODO: multi-valued?)
 	gps          map[blob.Ref]latLong            // wholeRef -> GPS coordinates
@@ -309,11 +309,15 @@ func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
 }
 
 func newCorpus() *Corpus {
+	permanodes, err := newPmCache(0)
+	if err != nil {
+		panic(err)
+	}
 	c := &Corpus{
 		blobs:                   make(map[blob.Ref]*camtypes.BlobMeta),
 		camBlobs:                make(map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta),
 		files:                   make(map[blob.Ref]camtypes.FileInfo),
-		permanodes:              make(map[blob.Ref]*PermanodeMeta),
+		permanodes:              permanodes,
 		imageInfo:               make(map[blob.Ref]camtypes.ImageInfo),
 		deletedBy:               make(map[blob.Ref]blob.Ref),
 		keyId:                   make(map[blob.Ref]string),
@@ -449,7 +453,10 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	}
 
 	c.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs[schema.TypeFile]))
-	c.permanodes = make(map[blob.Ref]*PermanodeMeta, len(c.camBlobs[schema.TypePermanode]))
+	var err error
+	if c.permanodes, err = newPmCache(len(c.camBlobs[schema.TypePermanode])); err != nil {
+		return err
+	}
 	cpu0 := osutil.CPUUsage()
 
 	var grp syncutil.Group
@@ -466,7 +473,11 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	}
 
 	// Post-load optimizations and restoration of invariants.
-	for _, pm := range c.permanodes {
+	//for _, pm := range c.permanodes {
+	if err := c.permanodes.Iter(func(br blob.Ref, pm *PermanodeMeta, err error) error {
+		if err != nil {
+			return err
+		}
 		// Restore invariants violated during building:
 		if err := pm.restoreInvariants(c.keyId); err != nil {
 			return err
@@ -479,7 +490,12 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 			cl.Permanode = c.br(cl.Permanode)
 			cl.Target = c.br(cl.Target)
 		}
+		return c.permanodes.Put(br, pm)
+	}); err != nil {
+		return err
 	}
+	//}
+
 	c.brOfStr = nil // drop this now.
 	c.building = false
 	// log.V(1).Printf("interned blob.Ref = %d", c.brInterns)
@@ -500,7 +516,7 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 			len(c.blobs),
 			float64(c.sumBlobBytes)/(1<<30),
 			c.numSchemaBlobs(),
-			len(c.permanodes),
+			c.permanodes.Len(),
 			len(c.files),
 			len(c.imageInfo))
 		c.logf("scanning CPU usage: %v", cpu)
@@ -695,10 +711,14 @@ func (c *Corpus) mergeClaimRow(k, v []byte) error {
 	cl.Value = c.str(cl.Value) // less likely to intern, but some (tags) do
 
 	pn := c.br(cl.Permanode)
-	pm, ok := c.permanodes[pn]
-	if !ok {
+	//pm, ok := c.permanodes[pn]
+	pm, err := c.permanodes.Get(pn)
+	if err != nil {
+		return err
+	}
+	if pm == nil {
 		pm = new(PermanodeMeta)
-		c.permanodes[pn] = pm
+		//c.permanodes[pn] = pm
 	}
 	pm.Claims = append(pm.Claims, &cl)
 	if !c.building {
@@ -720,7 +740,7 @@ func (c *Corpus) mergeClaimRow(k, v []byte) error {
 		}
 		set[pn] = true
 	}
-	return nil
+	return c.permanodes.Put(pn, pm)
 }
 
 func (c *Corpus) mergeFileInfoRow(k, v []byte) error {
@@ -1016,15 +1036,22 @@ func (lsp *lazySortedPermanodes) sorted(reverse bool) []pnAndTime {
 	// invalidate the caches
 	lsp.sortedCache = nil
 	lsp.sortedCacheReversed = nil
-	pns := make([]pnAndTime, 0, len(lsp.c.permanodes))
-	for pn := range lsp.c.permanodes {
+	//pns := make([]pnAndTime, 0, len(lsp.c.permanodes))
+	pns := make([]pnAndTime, 0, lsp.c.permanodes.Len())
+	//for pn := range lsp.c.permanodes {
+	if err := lsp.c.permanodes.IterKeys(func(pn blob.Ref, err error) error {
 		if lsp.c.IsDeleted(pn) {
-			continue
+			//continue
+			return nil
 		}
 		if pt, ok := lsp.pnTime(pn); ok {
 			pns = append(pns, pnAndTime{pn, pt})
 		}
+		return nil
+	}); err != nil {
+		return lsp.sortedCache
 	}
+	//}
 	// and rebuild one of them
 	if reverse {
 		sort.Sort(sort.Reverse(byPermanodeTime(pns)))
@@ -1169,8 +1196,10 @@ func (c *Corpus) PermanodeAnyTime(pn blob.Ref) (t time.Time, ok bool) {
 
 func (c *Corpus) pnCamliContent(pn blob.Ref) (cc blob.Ref, t time.Time, ok bool) {
 	// TODO(bradfitz): keep this property cached
-	pm, ok := c.permanodes[pn]
-	if !ok {
+	//pm, ok := c.permanodes[pn]
+	pm, _ := c.permanodes.Get(pn)
+	//if !ok {
+	if pm == nil {
 		return
 	}
 	for _, cl := range pm.Claims {
@@ -1199,8 +1228,10 @@ func (c *Corpus) pnCamliContent(pn blob.Ref) (cc blob.Ref, t time.Time, ok bool)
 // claim date nor the date of the delete claim affect the modtime of
 // the permanode.
 func (c *Corpus) PermanodeModtime(pn blob.Ref) (t time.Time, ok bool) {
-	pm, ok := c.permanodes[pn]
-	if !ok {
+	//pm, ok := c.permanodes[pn]
+	pm, _ := c.permanodes.Get(pn)
+	//if !ok {
+	if pm == nil {
 		return
 	}
 
@@ -1226,12 +1257,15 @@ func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 	attr string,
 	at time.Time,
 	signerFilter string) string {
-	pm, ok := c.permanodes[permaNode]
-	if !ok {
+	//pm, ok := c.permanodes[permaNode]
+	pm, _ := c.permanodes.Get(permaNode)
+	//if !ok {
+	if pm == nil {
 		return ""
 	}
 	var signerRefs SignerRefSet
 	if signerFilter != "" {
+		var ok bool
 		signerRefs, ok = c.signerRefs[signerFilter]
 		if !ok {
 			return ""
@@ -1272,11 +1306,14 @@ func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 func (c *Corpus) permanodeAttrsOrClaims(permaNode blob.Ref,
 	at time.Time, signerID string) (m map[string][]string, claims []*camtypes.Claim) {
 
-	pm, ok := c.permanodes[permaNode]
-	if !ok {
+	//pm, ok := c.permanodes[permaNode]
+	pm, _ := c.permanodes.Get(permaNode)
+	//if !ok {
+	if pm == nil {
 		return nil, nil
 	}
 
+	var ok bool
 	m, ok = pm.valuesAtSigner(at, signerID)
 	if ok {
 		return m, nil
@@ -1296,12 +1333,15 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 	if len(dst) > 0 {
 		panic("len(dst) must be 0")
 	}
-	pm, ok := c.permanodes[permaNode]
-	if !ok {
+	//pm, ok := c.permanodes[permaNode]
+	pm, _ := c.permanodes.Get(permaNode)
+	//if !ok {
+	if pm == nil {
 		return dst
 	}
 	var signerRefs SignerRefSet
 	if signerFilter != "" {
+		var ok bool
 		signerRefs, ok = c.signerRefs[signerFilter]
 		if !ok {
 			return dst
@@ -1346,13 +1386,16 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 func (c *Corpus) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNode blob.Ref,
 	signerFilter string,
 	attrFilter string) ([]camtypes.Claim, error) {
-	pm, ok := c.permanodes[permaNode]
-	if !ok {
+	//pm, ok := c.permanodes[permaNode]
+	pm, _ := c.permanodes.Get(permaNode)
+	//if !ok {
+	if pm == nil {
 		return nil, nil
 	}
 
 	var signerRefs SignerRefSet
 	if signerFilter != "" {
+		var ok bool
 		signerRefs, ok = c.signerRefs[signerFilter]
 		if !ok {
 			return dst, nil
@@ -1453,8 +1496,10 @@ func (c *Corpus) FileLatLong(fileRef blob.Ref) (lat, long float64, ok bool) {
 // If fn returns false, iteration ends.
 // Iteration is in an undefined order.
 func (c *Corpus) ForeachClaim(permaNode blob.Ref, at time.Time, fn func(*camtypes.Claim) bool) {
-	pm, ok := c.permanodes[permaNode]
-	if !ok {
+	//pm, ok := c.permanodes[permaNode]
+	pm, _ := c.permanodes.Get(permaNode)
+	//if !ok {
+	if pm == nil {
 		return
 	}
 	for _, cl := range pm.Claims {
@@ -1487,8 +1532,10 @@ func (c *Corpus) ForeachClaimBack(value blob.Ref, at time.Time, fn func(*camtype
 // time at (zero means now) has the given attribute with the given
 // value. If the attribute is multi-valued, any may match.
 func (c *Corpus) PermanodeHasAttrValue(pn blob.Ref, at time.Time, attr, val string) bool {
-	pm, ok := c.permanodes[pn]
-	if !ok {
+	//pm, ok := c.permanodes[pn]
+	pm, _ := c.permanodes.Get(pn)
+	//if !ok {
+	if pm == nil {
 		return false
 	}
 	if values, ok := pm.valuesAtSigner(at, ""); ok {

@@ -36,6 +36,7 @@ require (
 	github.com/jonas-p/go-shp v0.1.1 // indirect
 	github.com/lib/pq v1.10.2
 	github.com/mailgun/mailgun-go v0.0.0-20171127222028-17e8bd11e87c
+	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/mattn/go-mastodon v0.0.5-0.20190517015615-8f6192e26b66
 	github.com/miekg/dns v1.1.43
 	github.com/nf/cr2 v0.0.0-20140528043846-05d46fef4f2f
@@ -53,18 +54,20 @@ require (
 	go4.org/intern v0.0.0-20211027215823-ae77deb06f29 // indirect
 	golang.org/x/crypto v0.0.0-20210421170649-83a5a9bb288b
 	golang.org/x/image v0.0.0-20210628002857-a66eb6448b8d
-	golang.org/x/net v0.0.0-20210716203947-853a461950ff
+	golang.org/x/net v0.0.0-20211216030914-fe4d6282115f
 	golang.org/x/oauth2 v0.0.0-20210628180205-a41e5a781914
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
+	golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
 	golang.org/x/term v0.0.0-20201210144234-2321bbc49cbf // indirect
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac
-	golang.org/x/tools v0.1.5 // indirect
+	golang.org/x/tools v0.1.8 // indirect
 	google.golang.org/api v0.42.0
 	google.golang.org/genproto v0.0.0-20210716133855-ce7ef5c701ea // indirect
 	gopkg.in/ini.v1 v1.51.0 // indirect
 	gopkg.in/mgo.v2 v2.0.0-20160818020120-3f83fa500528
 	honnef.co/go/js/dom v0.0.0-20200509013220-d4405f7ab4d8
 	honnef.co/go/tools v0.2.1
+	modernc.org/ccgo/v3 v3.13.0 // indirect
 	modernc.org/sqlite v1.14.3
 	myitcv.io v0.0.0-20201125173645-a7167afc9e13
 	rsc.io/pdf v0.1.1
