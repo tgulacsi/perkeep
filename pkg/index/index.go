@@ -893,7 +893,7 @@ func (x *Index) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNod
 		if mustHave != "" && !strings.Contains(val, mustHave) {
 			continue
 		}
-		cl, ok := kvClaim(it.Key(), val, blob.Parse)
+		cl, ok := kvClaim(it.Key(), val)
 		if !ok {
 			continue
 		}
@@ -913,7 +913,7 @@ func (x *Index) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNod
 	return dst, nil
 }
 
-func kvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtypes.Claim, ok bool) {
+func kvClaim(k, v string) (c camtypes.Claim, ok bool) {
 	const nKeyPart = 5
 	const nValPart = 4
 	var keya [nKeyPart]string
@@ -923,15 +923,15 @@ func kvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtypes.C
 	if len(keyPart) < nKeyPart || len(valPart) < nValPart {
 		return
 	}
-	signerRef, ok := blobParse(valPart[3])
+	signerRef, ok := blob.Parse(valPart[3])
 	if !ok {
 		return
 	}
-	permaNode, ok := blobParse(keyPart[1])
+	permaNode, ok := blob.Parse(keyPart[1])
 	if !ok {
 		return
 	}
-	claimRef, ok := blobParse(keyPart[4])
+	claimRef, ok := blob.Parse(keyPart[4])
 	if !ok {
 		return
 	}
