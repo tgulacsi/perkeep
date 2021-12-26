@@ -46,7 +46,7 @@ func (c *Corpus) Exp_files(br blob.Ref) camtypes.FileInfo {
 }
 
 func ExpKvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtypes.Claim, ok bool) {
-	return kvClaim(k, v, blobParse)
+	return kvClaim(k, v)
 }
 
 func (c *Corpus) SetClaims(pn blob.Ref, claims []*camtypes.Claim) {
@@ -54,7 +54,8 @@ func (c *Corpus) SetClaims(pn blob.Ref, claims []*camtypes.Claim) {
 		Claims: claims,
 	}
 	pm.restoreInvariants(c.keyId)
-	c.permanodes[pn] = pm
+	//c.permanodes[pn] = pm
+	_ = c.permanodes.Put(pn, pm)
 }
 
 func (c *Corpus) Exp_AddKeyID(signerRef blob.Ref, signerID string) error {
