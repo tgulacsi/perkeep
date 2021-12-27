@@ -194,7 +194,10 @@ func (m attrValues) cacheAttrClaim(cl *camtypes.Claim) {
 // restoreInvariants sorts claims by date and
 // recalculates latest attributes.
 func (pm *PermanodeMeta) restoreInvariants(signers signerFromBlobrefMap) error {
-	sort.Sort(camtypes.ClaimPtrsByDate(pm.Claims))
+	cs := camtypes.ClaimPtrsByDate(pm.Claims)
+	if !sort.IsSorted(cs) {
+		sort.Sort(cs)
+	}
 	pm.attr = make(attrValues)
 	pm.signer = make(map[string]attrValues)
 	for _, cl := range pm.Claims {
@@ -283,8 +286,9 @@ func (pm *PermanodeMeta) appendAttrClaim(cl *camtypes.Claim, signers signerFromB
 // the given time, because e.g. some claims are more recent than this time. In
 // which case, the caller should resort to querying another source, such as pm.Claims.
 // The returned map must not be changed by the caller.
-func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
-	signerFilter string) (v attrValues, ok bool) {
+func (pm *PermanodeMeta) valuesAtSigner(
+	at time.Time, signerFilter string,
+) (v attrValues, ok bool) {
 
 	if pm.attr == nil {
 		return nil, false
@@ -719,6 +723,8 @@ func (c *Corpus) mergeClaimRow(k, v []byte) error {
 	if pm == nil {
 		pm = new(PermanodeMeta)
 		//c.permanodes[pn] = pm
+	} else if err = pm.restoreInvariants(c.keyId); err != nil {
+		return err
 	}
 	pm.Claims = append(pm.Claims, &cl)
 	if !c.building {
@@ -1201,6 +1207,8 @@ func (c *Corpus) pnCamliContent(pn blob.Ref) (cc blob.Ref, t time.Time, ok bool)
 	//if !ok {
 	if pm == nil {
 		return
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
+		return
 	}
 	for _, cl := range pm.Claims {
 		if cl.Attr != "camliContent" {
@@ -1233,6 +1241,8 @@ func (c *Corpus) PermanodeModtime(pn blob.Ref) (t time.Time, ok bool) {
 	//if !ok {
 	if pm == nil {
 		return
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
+		return
 	}
 
 	// Note: We intentionally don't try to derive any information
@@ -1256,11 +1266,14 @@ func (c *Corpus) PermanodeModtime(pn blob.Ref) (t time.Time, ok bool) {
 func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 	attr string,
 	at time.Time,
-	signerFilter string) string {
+	signerFilter string,
+) string {
 	//pm, ok := c.permanodes[permaNode]
 	pm, _ := c.permanodes.Get(permaNode)
 	//if !ok {
 	if pm == nil {
+		return ""
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
 		return ""
 	}
 	var signerRefs SignerRefSet
@@ -1304,12 +1317,15 @@ func (c *Corpus) PermanodeAttrValue(permaNode blob.Ref,
 //
 // The returned values must not be changed by the caller.
 func (c *Corpus) permanodeAttrsOrClaims(permaNode blob.Ref,
-	at time.Time, signerID string) (m map[string][]string, claims []*camtypes.Claim) {
+	at time.Time, signerID string,
+) (m map[string][]string, claims []*camtypes.Claim) {
 
 	//pm, ok := c.permanodes[permaNode]
 	pm, _ := c.permanodes.Get(permaNode)
 	//if !ok {
 	if pm == nil {
+		return nil, nil
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
 		return nil, nil
 	}
 
@@ -1329,7 +1345,8 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 	permaNode blob.Ref,
 	attr string,
 	at time.Time,
-	signerFilter string) []string {
+	signerFilter string,
+) []string {
 	if len(dst) > 0 {
 		panic("len(dst) must be 0")
 	}
@@ -1338,6 +1355,8 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 	//if !ok {
 	if pm == nil {
 		return dst
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
+		return nil
 	}
 	var signerRefs SignerRefSet
 	if signerFilter != "" {
@@ -1385,11 +1404,14 @@ func (c *Corpus) AppendPermanodeAttrValues(dst []string,
 
 func (c *Corpus) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNode blob.Ref,
 	signerFilter string,
-	attrFilter string) ([]camtypes.Claim, error) {
+	attrFilter string,
+) ([]camtypes.Claim, error) {
 	//pm, ok := c.permanodes[permaNode]
 	pm, _ := c.permanodes.Get(permaNode)
 	//if !ok {
 	if pm == nil {
+		return nil, nil
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
 		return nil, nil
 	}
 
@@ -1536,6 +1558,8 @@ func (c *Corpus) PermanodeHasAttrValue(pn blob.Ref, at time.Time, attr, val stri
 	pm, _ := c.permanodes.Get(pn)
 	//if !ok {
 	if pm == nil {
+		return false
+	} else if err := pm.restoreInvariants(c.keyId); err != nil {
 		return false
 	}
 	if values, ok := pm.valuesAtSigner(at, ""); ok {
