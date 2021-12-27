@@ -38,6 +38,7 @@ require (
 	github.com/mailgun/mailgun-go v0.0.0-20171127222028-17e8bd11e87c
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/mattn/go-mastodon v0.0.5-0.20190517015615-8f6192e26b66
+	github.com/mattn/go-sqlite3 v1.14.9 // indirect
 	github.com/miekg/dns v1.1.43
 	github.com/nf/cr2 v0.0.0-20140528043846-05d46fef4f2f
 	github.com/perkeep/b2 v0.0.0-20180913003434-1ae8d9b78db9
