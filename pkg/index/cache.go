@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"perkeep.org/pkg/blob"
@@ -99,26 +100,40 @@ func newPmCacheMem(sizeHint int) (pmCacheMem, error) {
 }
 
 type pmCacheSqlite struct {
-	db *sql.DB
-	fn string
+	db   *sql.DB
+	conn *sql.Conn
+	fn   string
 }
 
-var _ permanodeCache = (pmCacheSqlite{})
+var _ permanodeCache = (*pmCacheSqlite)(nil)
 
-func newPmCacheSqlite(_ int) (pmCacheSqlite, error) {
+func newPmCacheSqlite(_ int) (*pmCacheSqlite, error) {
 	fh, err := os.CreateTemp("", "perkeep-pm-cache-*.sqlite")
-	db, err := sql.Open("sqlite", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl")
+	db, err := sql.Open("sqlite", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl&cache=shared")
 	fh.Close()
 	if err != nil {
-		return pmCacheSqlite{}, err
+		return nil, err
 	}
-	db.SetMaxIdleConns(2)
-	db.SetMaxOpenConns(2)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, qry := range []string{
-		`CREATE TABLE IF NOT EXISTS pm_cache (blob_ref BLOB, PRIMARY KEY(blob_ref));`,
-		`CREATE TABLE IF NOT EXISTS pm_cache_claim (
+	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(3)
+
+	c := &pmCacheSqlite{db: db, fn: fh.Name()}
+	if err = func() error {
+		var err error
+		if c.conn, err = db.Conn(context.Background()); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var tx *sql.Tx
+		for i, qry := range []string{
+			`PRAGMA journal_mode = wal;
+PRAGMA locking_mode = exclusive;
+PRAGMA read_uncommitted = true;
+PRAGMA synchronous = normal;
+PRAGMA temp_store = 2;`,
+			`CREATE TABLE IF NOT EXISTS pm_cache (blob_ref BLOB, PRIMARY KEY(blob_ref));`,
+			`CREATE TABLE IF NOT EXISTS pm_cache_claim (
   blob_ref BLOB, signer BLOB, --BlobRef, Signer blob.Ref
   date BIGINT, --Date time.Time
   type TEXT, --Type string // "set-attribute", "add-attribute", etc
@@ -127,31 +142,53 @@ func newPmCacheSqlite(_ int) (pmCacheSqlite, error) {
   permanode BLOB,
   target BLOB
 );`,
-		`CREATE INDEX IF NOT EXISTS K_pm_cache_claim ON pm_cache_claim(blob_ref);`,
-		`CREATE TABLE IF NOT EXISTS pm_cache_attr(
+			`CREATE INDEX IF NOT EXISTS K_pm_cache_claim ON pm_cache_claim(blob_ref);`,
+			`CREATE TABLE IF NOT EXISTS pm_cache_attr(
   blob_ref BLOB,
   sig_id TEXT,
   attr TEXT,
   value TEXT
 );`,
-		`CREATE INDEX IF NOT EXISTS K_pm_cache_attr ON pm_cache_attr(blob_ref);`,
-	} {
-		if _, err = db.ExecContext(ctx, qry); err != nil {
-			db.Close()
-			return pmCacheSqlite{}, fmt.Errorf("exec %s: %w", qry, err)
+			`CREATE INDEX IF NOT EXISTS K_pm_cache_attr ON pm_cache_attr(blob_ref);`,
+		} {
+			if _, err = c.conn.ExecContext(ctx, qry); err != nil {
+				return fmt.Errorf("exec %s: %w", qry, err)
+			}
+			if i == 0 {
+				if tx, err = c.conn.BeginTx(ctx, nil); err != nil {
+					return err
+				}
+				defer tx.Rollback()
+			}
+		}
+		return tx.Commit()
+	}(); err != nil {
+		c.Close()
+		return nil, err
+	}
+	runtime.SetFinalizer(c, func(_ interface{}) { _ = c.Close() })
+	return c, nil
+}
+func (c *pmCacheSqlite) Close() error {
+	fn, conn, db := c.fn, c.conn, c.db
+	c.fn, c.conn, c.db = "", nil, nil
+	if db != nil {
+		fmt.Println("CLOSE", fn)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		err := db.Close()
+		if fn != "" {
+			_ = os.Remove(fn)
+		}
+		if err != nil {
+			return fmt.Errorf("close: %w", err)
 		}
 	}
-	return pmCacheSqlite{db: db, fn: fh.Name()}, nil
-}
-func (c pmCacheSqlite) Close() error {
-	err := c.db.Close()
-	if c.fn != "" {
-		_ = os.Remove(c.fn)
-	}
-	return err
+	return nil
 }
 
-func (c pmCacheSqlite) Len() int {
+func (c *pmCacheSqlite) Len() int {
 	const qry = "SELECT COUNT(0) FROM pm_cache;"
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	var n int
@@ -159,20 +196,30 @@ func (c pmCacheSqlite) Len() int {
 	cancel()
 	return n
 }
-func (c pmCacheSqlite) IterKeys(f func(blob.Ref, error) error) error {
-	const qry = `SELECT blob_ref FROM pm_cache;`
+func (c *pmCacheSqlite) IterKeys(f func(blob.Ref, error) error) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rows, err := c.db.QueryContext(ctx, qry)
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return fmt.Errorf("%s: %w", qry, err)
+		return err
+	}
+	defer tx.Rollback()
+	return c.iterKeys(ctx, tx, f)
+}
+
+func (c *pmCacheSqlite) iterKeys(ctx context.Context, tx *sql.Tx, f func(blob.Ref, error) error) error {
+	const qry = `SELECT blob_ref FROM pm_cache;`
+	rows, err := tx.QueryContext(ctx, qry)
+	if err != nil {
+		return fmt.Errorf("iterkeys %s: %w", qry, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var b []byte
 		if err = rows.Scan(&b); err != nil {
-			return fmt.Errorf("%s: %w", qry, err)
+			return fmt.Errorf("scan %s: %w", qry, err)
 		}
+		//fmt.Println(b)
 		var br blob.Ref
 		if err = br.UnmarshalBinary(b); err != nil {
 			return err
@@ -184,22 +231,24 @@ func (c pmCacheSqlite) IterKeys(f func(blob.Ref, error) error) error {
 			return err
 		}
 	}
-	return nil
+	return rows.Close()
 }
-func (c pmCacheSqlite) Iter(f func(blob.Ref, *PermanodeMeta, error) error) error {
-	return c.IterKeys(func(br blob.Ref, err error) error {
+func (c *pmCacheSqlite) Iter(f func(blob.Ref, *PermanodeMeta, error) error) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	return c.iterKeys(ctx, tx, func(br blob.Ref, err error) error {
 		if err != nil {
 			return err
 		}
-		pm, err := c.Get(br)
+		pm, err := c.get(ctx, tx, br)
 		return f(br, pm, err)
 	})
 }
-func (c pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
-	brB, err := br.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
+func (c *pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -207,15 +256,20 @@ func (c pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
+	return c.get(ctx, tx, br)
+}
 
-	fmt.Printf("Get(%q)\n", br)
-	defer fmt.Printf("got(%q)\n", br)
+func (c *pmCacheSqlite) get(ctx context.Context, tx *sql.Tx, br blob.Ref) (*PermanodeMeta, error) {
+	brB, err := br.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
 	var pm PermanodeMeta
 	if err = func() error {
 		const qryClaim = "SELECT signer, date, type, attr, value, permanode, target FROM pm_cache_claim WHERE blob_ref = $1 ORDER BY date;"
 		rows, err := tx.QueryContext(ctx, qryClaim, brB)
 		if err != nil {
-			return fmt.Errorf("%s: %w", qryClaim, err)
+			return fmt.Errorf("query %s: %w", qryClaim, err)
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -223,7 +277,7 @@ func (c pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
 			var dt int64
 			var claim camtypes.Claim
 			if err = rows.Scan(&signer, &dt, &claim.Type, &claim.Attr, &claim.Value, &permanode, &target); err != nil {
-				return fmt.Errorf("%s: %w", qryClaim, err)
+				return fmt.Errorf("scan %s: %w", qryClaim, err)
 			}
 			if err = claim.Signer.UnmarshalBinary(signer); err != nil {
 				return err
@@ -250,13 +304,13 @@ func (c pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
 		const qryAttr = "SELECT sig_id, attr, value FROM pm_cache_attr WHERE blob_ref = $1;"
 		rows, err := tx.QueryContext(ctx, qryAttr, brB)
 		if err != nil {
-			return fmt.Errorf("%s: %w", qryAttr, err)
+			return fmt.Errorf("query %s: %w", qryAttr, err)
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var sig, attr, value string
 			if err = rows.Scan(&sig, &attr, &value); err != nil {
-				return fmt.Errorf("%s: %w", qryAttr, err)
+				return fmt.Errorf("scan %s: %w", qryAttr, err)
 			}
 			if pm.attr == nil {
 				pm.attr = make(attrValues)
@@ -274,24 +328,23 @@ func (c pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
 	}()
 	return &pm, err
 }
-func (c pmCacheSqlite) Put(br blob.Ref, pm *PermanodeMeta) error {
+func (c *pmCacheSqlite) Put(br blob.Ref, pm *PermanodeMeta) error {
 	if pm == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	fmt.Printf("Put(%q)\n", br)
-	defer fmt.Printf("put(%q)\n", br)
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	brB, err := br.MarshalBinary()
 	if err != nil {
 		return err
 	}
-	//fmt.Println(c.fn, br.String())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tx, err := c.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("put BEGIN: %w", err)
+	}
+	defer tx.Rollback()
+
 	const insRef = `DELETE FROM pm_cache_claim WHERE blob_ref = $1;
 DELETE FROM pm_cache_attr WHERE  blob_ref = $2;
 INSERT OR IGNORE INTO pm_cache (blob_ref) VALUES ($3);`
@@ -328,8 +381,7 @@ INSERT OR IGNORE INTO pm_cache (blob_ref) VALUES ($3);`
 
 	if len(pm.Claims) != 0 {
 		if err = func() error {
-			const insClaim = `DELETE FROM pm_cache_claim WHERE blob_ref = $1;
-INSERT INTO pm_cache_claim 
+			const insClaim = `INSERT INTO pm_cache_claim 
   (blob_ref, signer, date, type, attr, value, permanode, target) 
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8);`
 			stmt, err := tx.PrepareContext(ctx, insClaim)
