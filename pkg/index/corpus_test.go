@@ -490,7 +490,7 @@ func testEnumerateOrder(t *testing.T,
 
 	c, err := idxd.Index.KeepInMemory()
 	if err != nil {
-		t.Fatalf("error slurping index to memory: %v", err)
+		t.Fatalf("error slurping index to memory: %+v", err)
 	}
 
 	// check that we get a different order whether with enumerate according to

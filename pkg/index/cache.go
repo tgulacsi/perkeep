@@ -161,7 +161,6 @@ func (c *pmCacheSqlite) Close() error {
 	fn, db := c.fn, c.db
 	c.fn, c.db = "", nil
 	if db != nil {
-		fmt.Println("CLOSE", fn)
 		err := db.Close()
 		if fn != "" {
 			_ = os.Remove(fn)
@@ -200,16 +199,11 @@ func (c *pmCacheSqlite) iterKeys(ctx context.Context, tx *sql.Tx, f func(blob.Re
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var b []byte
-		if err = rows.Scan(&b); err != nil {
+		var s string
+		if err = rows.Scan(&s); err != nil {
 			return fmt.Errorf("scan %s: %w", qry, err)
 		}
-		//fmt.Println(b)
-		var br blob.Ref
-		if err = br.UnmarshalBinary(b); err != nil {
-			return err
-		}
-		if err := f(br, nil); err != nil {
+		if err := f(blob.ParseOrZero(s), nil); err != nil {
 			if errors.Is(err, ErrIterBreak) {
 				return nil
 			}

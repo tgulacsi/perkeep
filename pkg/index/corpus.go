@@ -448,12 +448,12 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	// populates the blobs map (used for blobref interning) and the camBlobs
 	// map (used for hinting the size of other maps)
 	if err := c.scanPrefix(scanmu, s, "meta:"); err != nil {
-		return err
+		return fmt.Errorf("scanPrefix meta: %w", err)
 	}
 
 	// we do the keyIDs first, because they're necessary to properly merge claims
 	if err := c.scanPrefix(scanmu, s, keySignerKeyID.name+":"); err != nil {
-		return err
+		return fmt.Errorf("scanPrefix "+keySignerKeyID.name+": %w", err)
 	}
 
 	c.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs[schema.TypeFile]))
@@ -470,7 +470,12 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 				prefix[:len(prefix)-1])
 		}
 		prefix := prefix
-		grp.Go(func() error { return c.scanPrefix(scanmu, s, prefix) })
+		grp.Go(func() error {
+			if err := c.scanPrefix(scanmu, s, prefix); err != nil {
+				return fmt.Errorf("scanPrefix %q: %w", prefix, err)
+			}
+			return nil
+		})
 	}
 	if err := grp.Err(); err != nil {
 		return err
@@ -480,11 +485,11 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	//for _, pm := range c.permanodes {
 	if err := c.permanodes.Iter(func(br blob.Ref, pm *PermanodeMeta, err error) error {
 		if err != nil {
-			return err
+			return fmt.Errorf("Iter %s (%v): %w", br, pm, err)
 		}
 		// Restore invariants violated during building:
 		if err := pm.restoreInvariants(c.keyId); err != nil {
-			return err
+			return fmt.Errorf("restore invariants of %v: %w", pm, err)
 		}
 
 		// And intern some stuff.
@@ -494,7 +499,10 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 			cl.Permanode = c.br(cl.Permanode)
 			cl.Target = c.br(cl.Target)
 		}
-		return c.permanodes.Put(br, pm)
+		if err := c.permanodes.Put(br, pm); err != nil {
+			return fmt.Errorf("permanodes.Put(%q, %v): %w", br, pm, err)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
