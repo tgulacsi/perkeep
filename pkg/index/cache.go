@@ -34,7 +34,10 @@ import (
 )
 
 func newPmCache(sizeHint int) (permanodeCache, error) {
-	return newPmCacheSqlite(sizeHint)
+	if true {
+		return newPmCacheSqlite(sizeHint)
+	}
+	return newPmCacheMem(sizeHint)
 }
 
 // permanodeCache is the interface for a permanode cache.
@@ -109,7 +112,7 @@ type pmCacheSqlite struct {
 
 var _ permanodeCache = (*pmCacheSqlite)(nil)
 
-func newPmCacheSqlite(_ int) (*pmCacheSqlite, error) {
+func newPmCacheSqlite(sizeHint int) (*pmCacheSqlite, error) {
 	fh, err := os.CreateTemp("", "perkeep-pm-cache-*.sqlite")
 	db, err := sql.Open("sqlite3", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl&cache=shared")
 	fh.Close()
@@ -130,17 +133,17 @@ PRAGMA locking_mode = exclusive;
 PRAGMA read_uncommitted = true;
 PRAGMA synchronous = normal;
 PRAGMA temp_store = 2;`,
-			`CREATE TABLE IF NOT EXISTS pm_cache (blob_ref BLOB, PRIMARY KEY(blob_ref))`,
+			`CREATE TABLE IF NOT EXISTS pm_cache (ref TEXT, PRIMARY KEY(ref))`,
 			`CREATE TABLE IF NOT EXISTS pm_cache_claim (
-  blob_ref BLOB, signer BLOB, --BlobRef, Signer blob.Ref
+  parent TEXT, ref TEXT, signer TEXT, --BlobRef, Signer blob.Ref
   date BIGINT, --Date time.Time
   type TEXT, --Type string // "set-attribute", "add-attribute", etc
   attr TEXT, 
   value TEXT,
-  permanode BLOB,
-  target BLOB
+  permanode TEXT,
+  target TEXT
 )`,
-			`CREATE INDEX IF NOT EXISTS K_pm_cache_claim ON pm_cache_claim(blob_ref)`,
+			`CREATE INDEX IF NOT EXISTS K_pm_cache_claim ON pm_cache_claim(parent)`,
 		} {
 			if _, err = c.db.ExecContext(ctx, qry); err != nil {
 				return fmt.Errorf("exec %s: %w", qry, err)
@@ -190,7 +193,7 @@ func (c *pmCacheSqlite) IterKeys(f func(blob.Ref, error) error) error {
 }
 
 func (c *pmCacheSqlite) iterKeys(ctx context.Context, tx *sql.Tx, f func(blob.Ref, error) error) error {
-	const qry = `SELECT blob_ref FROM pm_cache`
+	const qry = `SELECT ref FROM pm_cache`
 	rows, err := tx.QueryContext(ctx, qry)
 	if err != nil {
 		return fmt.Errorf("iterkeys %s: %w", qry, err)
@@ -242,41 +245,42 @@ func (c *pmCacheSqlite) Get(br blob.Ref) (*PermanodeMeta, error) {
 }
 
 func (c *pmCacheSqlite) get(ctx context.Context, tx *sql.Tx, br blob.Ref) (*PermanodeMeta, error) {
-	brB, err := br.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
 	c.gate.Start()
 	defer c.gate.Done()
 	var pm PermanodeMeta
-	if err = func() error {
-		const qryClaim = "SELECT signer, date, type, attr, value, permanode, target FROM pm_cache_claim WHERE blob_ref = ? ORDER BY date"
-		rows, err := tx.QueryContext(ctx, qryClaim, brB)
+	parent := br.String()
+	if err := func() error {
+		const qryClaim = "SELECT ref, signer, date, type, attr, value, permanode, target FROM pm_cache_claim WHERE parent = ? ORDER BY date"
+		rows, err := tx.QueryContext(ctx, qryClaim, parent)
 		if err != nil {
 			return fmt.Errorf("query %s: %w", qryClaim, err)
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var signer, permanode, target []byte
+			var ref, signer, permanode, target string
 			var dt int64
 			var claim camtypes.Claim
-			if err = rows.Scan(&signer, &dt, &claim.Type, &claim.Attr, &claim.Value, &permanode, &target); err != nil {
+			if err = rows.Scan(
+				&ref, &signer, &dt,
+				&claim.Type, &claim.Attr, &claim.Value,
+				&permanode, &target,
+			); err != nil {
 				return fmt.Errorf("scan %s: %w", qryClaim, err)
 			}
-			if err = claim.Signer.UnmarshalBinary(signer); err != nil {
-				return err
+			for _, elt := range []struct {
+				Src  string
+				Dest *blob.Ref
+			}{
+				{ref, &claim.BlobRef},
+				{signer, &claim.Signer},
+				{permanode, &claim.Permanode},
+				{target, &claim.Target},
+			} {
+				if len(elt.Src) != 0 {
+					*elt.Dest = blob.ParseOrZero(elt.Src)
+				}
 			}
 			claim.Date = time.UnixMilli(dt)
-			if len(permanode) != 0 {
-				if err = claim.Permanode.UnmarshalBinary(permanode); err != nil {
-					return err
-				}
-			}
-			if len(target) != 0 {
-				if err = claim.Target.UnmarshalBinary(target); err != nil {
-					return err
-				}
-			}
 			pm.Claims = append(pm.Claims, &claim)
 		}
 		return rows.Close()
@@ -290,10 +294,6 @@ func (c *pmCacheSqlite) Put(br blob.Ref, pm *PermanodeMeta) error {
 	if pm == nil {
 		return nil
 	}
-	brB, err := br.MarshalBinary()
-	if err != nil {
-		return err
-	}
 	c.gate.Start()
 	defer c.gate.Done()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -305,43 +305,34 @@ func (c *pmCacheSqlite) Put(br blob.Ref, pm *PermanodeMeta) error {
 	}
 	defer tx.Rollback()
 
-	const insRef = `DELETE FROM pm_cache_claim WHERE blob_ref = ?;
-INSERT OR IGNORE INTO pm_cache (blob_ref) VALUES (?);`
-	if _, err = tx.ExecContext(ctx, insRef, brB, brB, brB); err != nil {
-		return fmt.Errorf("exec %s [%v]: %w", insRef, brB, err)
+	parent := br.String()
+	const insRef = `DELETE FROM pm_cache_claim WHERE parent = ?;
+INSERT OR IGNORE INTO pm_cache (ref) VALUES (?);`
+	if _, err = tx.ExecContext(ctx, insRef, parent, parent); err != nil {
+		return fmt.Errorf("exec %s [%v]: %w", insRef, parent, err)
 	}
 
 	if len(pm.Claims) != 0 {
 		if err = func() error {
 			const insClaim = `INSERT INTO pm_cache_claim 
-  (blob_ref, signer, date, type, attr, value, permanode, target) 
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  (parent, ref, signer, date, type, attr, value, permanode, target) 
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 			stmt, err := tx.PrepareContext(ctx, insClaim)
 			if err != nil {
 				return fmt.Errorf("prepare %s: %w", insClaim, err)
 			}
 			defer stmt.Close()
 			for _, claim := range pm.Claims {
-				signer, err := claim.Signer.MarshalBinary()
-				if err != nil {
-					return err
-				}
 				dt := claim.Date.UnixMilli()
-				var permanode, target []byte
-				if claim.Permanode.Valid() {
-					if permanode, err = claim.Permanode.MarshalBinary(); err != nil {
-						return err
-					}
-				}
-				if claim.Target.Valid() {
-					if target, err = claim.Target.MarshalBinary(); err != nil {
-						return err
-					}
-				}
 				if _, err = stmt.ExecContext(ctx,
-					brB, signer, dt, claim.Type, claim.Attr, claim.Value, permanode, target,
+					parent, claim.BlobRef.String(), claim.Signer.String(), dt,
+					claim.Type, claim.Attr, claim.Value,
+					claim.Permanode.String(), claim.Target.String(),
 				); err != nil {
-					return fmt.Errorf("exec %s [%v %v %v %q %q %v %v]: %w", insClaim, brB, signer, dt, claim.Attr, claim.Value, permanode, target, err)
+					return fmt.Errorf("exec %s [%v %v %v %v %q %q %v %v]: %w",
+						insClaim, parent, claim.BlobRef, claim.Signer, dt,
+						claim.Attr, claim.Value, claim.Permanode, claim.Target,
+						err)
 				}
 			}
 			return nil
