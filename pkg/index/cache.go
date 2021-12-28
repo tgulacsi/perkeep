@@ -29,8 +29,8 @@ import (
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/types/camtypes"
 
-	//_ "modernc.org/sqlite"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
+	//_ "github.com/mattn/go-sqlite3"
 )
 
 func newPmCache(sizeHint int) (permanodeCache, error) {
@@ -114,7 +114,7 @@ var _ permanodeCache = (*pmCacheSqlite)(nil)
 
 func newPmCacheSqlite(sizeHint int) (*pmCacheSqlite, error) {
 	fh, err := os.CreateTemp("", "perkeep-pm-cache-*.sqlite")
-	db, err := sql.Open("sqlite3", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl&cache=shared")
+	db, err := sql.Open("sqlite", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl&cache=shared")
 	fh.Close()
 	if err != nil {
 		return nil, err
