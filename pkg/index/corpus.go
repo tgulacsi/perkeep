@@ -313,7 +313,7 @@ func (pm *PermanodeMeta) valuesAtSigner(
 }
 
 func newCorpus() *Corpus {
-	permanodes, err := newPmCache(0)
+	permanodes, err := newPmCache("", 0)
 	if err != nil {
 		panic(err)
 	}
@@ -458,7 +458,7 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 
 	c.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs[schema.TypeFile]))
 	var err error
-	if c.permanodes, err = newPmCache(len(c.camBlobs[schema.TypePermanode])); err != nil {
+	if c.permanodes, err = newPmCache("", len(c.camBlobs[schema.TypePermanode])); err != nil {
 		return err
 	}
 	cpu0 := osutil.CPUUsage()

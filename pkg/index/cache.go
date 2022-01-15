@@ -17,25 +17,33 @@ limitations under the License.
 package index
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"go4.org/syncutil"
 	"perkeep.org/pkg/blob"
+	"perkeep.org/pkg/sorted"
+	"perkeep.org/pkg/sorted/leveldb"
 	"perkeep.org/pkg/types/camtypes"
 
-	_ "modernc.org/sqlite"
-	//_ "github.com/mattn/go-sqlite3"
+	//_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-func newPmCache(sizeHint int) (permanodeCache, error) {
+func newPmCache(path string, sizeHint int) (permanodeCache, error) {
 	if true {
-		return newPmCacheSqlite(sizeHint)
+		return newPmCacheSorted(path)
+	} else {
+		// SQLite is slow, modernc.org/sqlite is more slow
+		return newPmCacheSqlite(path)
 	}
 	return newPmCacheMem(sizeHint)
 }
@@ -96,6 +104,139 @@ func (c pmCacheMem) Put(br blob.Ref, pm *PermanodeMeta) error {
 	return nil
 }
 
+type pmCacheSorted struct {
+	db     sorted.KeyValue
+	encBuf strings.Builder
+	decBuf bytes.Buffer
+	enc    *gob.Encoder
+	dec    *gob.Decoder
+	gate   *syncutil.Gate
+	tbd    string
+}
+
+func newPmCacheSorted(path string) (*pmCacheSorted, error) {
+	// sorted.KeyValue as a value limit of 63000
+	var tbd string
+	if path == "" {
+		var err error
+		if path, err = os.MkdirTemp("", "perkeep-pm-cache-*.leveldb"); err != nil {
+			return nil, err
+		}
+		tbd = path
+	}
+	db, err := leveldb.NewStorage(path)
+	if err != nil {
+		return nil, err
+	}
+	c := &pmCacheSorted{db: db, gate: syncutil.NewGate(1), tbd: tbd}
+	runtime.SetFinalizer(c, func(_ interface{}) { _ = c.Close() })
+	return c, nil
+}
+
+func (c *pmCacheSorted) Close() error {
+	db, tbd := c.db, c.tbd
+	c.db = nil
+	c.encBuf.Reset()
+	c.decBuf.Reset()
+	var err error
+	if db != nil {
+		err = db.Close()
+	}
+	if tbd != "" {
+		_ = os.RemoveAll(tbd)
+	}
+	if err != nil {
+		return fmt.Errorf("close: %w", err)
+	}
+	return nil
+}
+func (c *pmCacheSorted) Len() int {
+	iter := c.db.Find("", "")
+	defer iter.Close()
+	var n int
+	for iter.Next() {
+		n++
+	}
+	return n
+}
+func (c *pmCacheSorted) IterKeys(f func(blob.Ref, error) error) error {
+	iter := c.db.Find("", "")
+	defer iter.Close()
+	for iter.Next() {
+		br, ok := blob.ParseBytes(iter.KeyBytes())
+		if !ok {
+			continue
+		}
+		if err := f(br, nil); err != nil {
+			if errors.Is(err, ErrIterBreak) {
+				return nil
+			}
+			return err
+		}
+	}
+	return iter.Close()
+}
+func (c *pmCacheSorted) decode(pm *PermanodeMeta, p []byte) error {
+	c.gate.Start()
+	defer c.gate.Done()
+	if c.dec == nil {
+		c.dec = gob.NewDecoder(&c.decBuf)
+	}
+	c.decBuf.Reset()
+	c.decBuf.Write(p)
+	return c.dec.Decode(pm)
+}
+func (c *pmCacheSorted) Iter(f func(blob.Ref, *PermanodeMeta, error) error) error {
+	iter := c.db.Find("", "")
+	defer iter.Close()
+	for iter.Next() {
+		br, ok := blob.ParseBytes(iter.KeyBytes())
+		if !ok {
+			continue
+		}
+		var pm PermanodeMeta
+		if err := c.decode(&pm, iter.ValueBytes()); err != nil {
+			return err
+		}
+		if err := f(br, &pm, nil); err != nil {
+			if errors.Is(err, ErrIterBreak) {
+				return nil
+			}
+			return err
+		}
+	}
+	return iter.Close()
+}
+func (c *pmCacheSorted) Get(br blob.Ref) (*PermanodeMeta, error) {
+	v, err := c.db.Get(br.String())
+	if err != nil {
+		if errors.Is(err, sorted.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%q: %w", br.String(), err)
+	}
+	var pm PermanodeMeta
+	if err = c.decode(&pm, []byte(v)); err != nil {
+		return nil, err
+	}
+	return &pm, nil
+}
+func (c *pmCacheSorted) Put(br blob.Ref, pm *PermanodeMeta) error {
+	if pm == nil {
+		return nil
+	}
+	c.gate.Start()
+	defer c.gate.Done()
+	if c.enc == nil {
+		c.enc = gob.NewEncoder(&c.encBuf)
+	}
+	c.encBuf.Reset()
+	if err := c.enc.Encode(pm); err != nil {
+		return err
+	}
+	return c.db.Set(br.String(), c.encBuf.String())
+}
+
 var ErrIterBreak = errors.New("break iteration")
 
 var _ permanodeCache = (pmCacheMem)(nil)
@@ -106,15 +247,26 @@ func newPmCacheMem(sizeHint int) (pmCacheMem, error) {
 
 type pmCacheSqlite struct {
 	db   *sql.DB
-	fn   string
+	tbd  string
 	gate *syncutil.Gate
 }
 
 var _ permanodeCache = (*pmCacheSqlite)(nil)
 
-func newPmCacheSqlite(sizeHint int) (*pmCacheSqlite, error) {
-	fh, err := os.CreateTemp("", "perkeep-pm-cache-*.sqlite")
-	db, err := sql.Open("sqlite", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl&cache=shared")
+func newPmCacheSqlite(path string) (*pmCacheSqlite, error) {
+	var fh *os.File
+	var err error
+	var tbd string
+	if path == "" {
+		fh, err = os.CreateTemp("", "perkeep-pm-cache-*.sqlite")
+		tbd = fh.Name()
+	} else {
+		fh, err = os.Create(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite3", "file://"+fh.Name()+"?mode=rwc&vfs=unix-excl&cache=shared")
 	fh.Close()
 	if err != nil {
 		return nil, err
@@ -122,7 +274,7 @@ func newPmCacheSqlite(sizeHint int) (*pmCacheSqlite, error) {
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(3)
 
-	c := &pmCacheSqlite{db: db, fn: fh.Name(), gate: syncutil.NewGate(1)}
+	c := &pmCacheSqlite{db: db, gate: syncutil.NewGate(1), tbd: tbd}
 	if err = func() error {
 		var err error
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -158,16 +310,17 @@ PRAGMA temp_store = 2;`,
 	return c, nil
 }
 func (c *pmCacheSqlite) Close() error {
-	fn, db := c.fn, c.db
-	c.fn, c.db = "", nil
+	tbd, db := c.tbd, c.db
+	c.tbd, c.db = "", nil
+	var err error
 	if db != nil {
-		err := db.Close()
-		if fn != "" {
-			_ = os.Remove(fn)
-		}
-		if err != nil {
-			return fmt.Errorf("close: %w", err)
-		}
+		err = db.Close()
+	}
+	if tbd != "" {
+		_ = os.Remove(tbd)
+	}
+	if err != nil {
+		return fmt.Errorf("close: %w", err)
 	}
 	return nil
 }
@@ -242,6 +395,7 @@ func (c *pmCacheSqlite) get(ctx context.Context, tx *sql.Tx, br blob.Ref) (*Perm
 	c.gate.Start()
 	defer c.gate.Done()
 	var pm PermanodeMeta
+	var found bool
 	parent := br.String()
 	if err := func() error {
 		const qryClaim = "SELECT ref, signer, date, type, attr, value, permanode, target FROM pm_cache_claim WHERE parent = ? ORDER BY date"
@@ -276,12 +430,16 @@ func (c *pmCacheSqlite) get(ctx context.Context, tx *sql.Tx, br blob.Ref) (*Perm
 			}
 			claim.Date = time.UnixMilli(dt)
 			pm.Claims = append(pm.Claims, &claim)
+			found = true
 		}
 		return rows.Close()
 	}(); err != nil {
 		return &pm, err
 	}
 
+	if !found {
+		return nil, nil
+	}
 	return &pm, nil
 }
 func (c *pmCacheSqlite) Put(br blob.Ref, pm *PermanodeMeta) error {
