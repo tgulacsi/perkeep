@@ -26,6 +26,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"go4.org/syncutil"
@@ -110,8 +111,8 @@ type pmCacheSorted struct {
 	decBuf bytes.Buffer
 	enc    *gob.Encoder
 	dec    *gob.Decoder
-	gate   *syncutil.Gate
 	tbd    string
+	mu     sync.Mutex
 }
 
 func newPmCacheSorted(path string) (*pmCacheSorted, error) {
@@ -128,7 +129,7 @@ func newPmCacheSorted(path string) (*pmCacheSorted, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &pmCacheSorted{db: db, gate: syncutil.NewGate(1), tbd: tbd}
+	c := &pmCacheSorted{db: db, tbd: tbd}
 	runtime.SetFinalizer(c, func(_ interface{}) { _ = c.Close() })
 	return c, nil
 }
@@ -177,8 +178,8 @@ func (c *pmCacheSorted) IterKeys(f func(blob.Ref, error) error) error {
 	return iter.Close()
 }
 func (c *pmCacheSorted) decode(pm *PermanodeMeta, p []byte) error {
-	c.gate.Start()
-	defer c.gate.Done()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.dec == nil {
 		c.dec = gob.NewDecoder(&c.decBuf)
 	}
@@ -225,16 +226,18 @@ func (c *pmCacheSorted) Put(br blob.Ref, pm *PermanodeMeta) error {
 	if pm == nil {
 		return nil
 	}
-	c.gate.Start()
-	defer c.gate.Done()
+	c.mu.Lock()
 	if c.enc == nil {
 		c.enc = gob.NewEncoder(&c.encBuf)
 	}
 	c.encBuf.Reset()
-	if err := c.enc.Encode(pm); err != nil {
+	err := c.enc.Encode(pm)
+	v := c.encBuf.String()
+	c.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	return c.db.Set(br.String(), c.encBuf.String())
+	return c.db.Set(br.String(), v)
 }
 
 var ErrIterBreak = errors.New("break iteration")
