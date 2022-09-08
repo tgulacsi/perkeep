@@ -47,6 +47,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
@@ -94,6 +95,7 @@ type storage struct {
 	writer *os.File
 	fds    []*os.File
 	size   int64
+	syncCh chan<- struct{}
 }
 
 func (s *storage) String() string {
@@ -189,11 +191,13 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 	// reads/writes consistent across diskpacked targets, regardless of what
 	// people put in their low level config.
 	root = strings.TrimRight(root, `\/`)
+	syncCh := make(chan struct{}, 1)
 	s = &storage{
 		root:         root,
 		index:        index,
 		maxFileSize:  maxFileSize,
 		Generationer: local.NewGenerationer(root),
+		syncCh:       syncCh,
 	}
 	if err := s.openAllPacks(); err != nil {
 		s.Close()
@@ -204,6 +208,27 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 	if _, _, err := s.StorageGeneration(); err != nil {
 		return nil, fmt.Errorf("error initialization generation for %q: %w", root, err)
 	}
+	// fsync goroutine
+	go func() {
+		timer := time.NewTimer(time.Second)
+		sync := func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if !s.closed && s.writer != nil {
+				s.writer.Sync()
+			}
+		}
+		for {
+			select {
+			case <-timer.C:
+				sync()
+				select {
+				case <-syncCh:
+					timer.Reset(time.Second)
+				}
+			}
+		}
+	}()
 	return s, nil
 }
 
@@ -703,8 +728,10 @@ func (s *storage) append(br blob.SizedRef, r io.Reader) error {
 	if n2 != int64(br.Size) {
 		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
 	}
-	if err = s.writer.Sync(); err != nil {
-		return err
+
+	select {
+	case s.syncCh <- struct{}{}:
+	default:
 	}
 
 	packIdx := len(s.fds) - 1
