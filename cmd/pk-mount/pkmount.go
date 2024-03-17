@@ -69,6 +69,7 @@ func main() {
 	// Scans the arg list and sets up flags
 	client.AddFlags()
 	flag.Usage = usage
+	flagRO := flag.Bool("read-only", true, "mount read-only")
 	flag.Parse()
 
 	if *cmdmain.FlagLegal {
@@ -179,7 +180,13 @@ func main() {
 
 	sigc := make(chan os.Signal, 1)
 
-	conn, err = fuse.Mount(mountPoint, fuse.FSName("perkeep"))
+	opts := []fuse.MountOption{
+		fuse.FSName("perkeep"), fuse.CacheSymlinks(), fuse.ReadOnly(),
+	}
+	if !*flagRO {
+		opts = opts[:len(opts)-1]
+	}
+	conn, err = fuse.Mount(mountPoint, opts...)
 	if err != nil {
 		log.Fatalf("Mount: %v", err)
 	}
