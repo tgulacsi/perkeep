@@ -40,6 +40,10 @@ import (
 
 var ctxbg = context.Background()
 
+func init() {
+	debug = debugT(env.IsDebug())
+}
+
 func newTempDiskpacked(t *testing.T) blobserver.Storage {
 	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{})
 }
