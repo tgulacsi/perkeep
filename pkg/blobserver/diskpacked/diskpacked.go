@@ -46,6 +46,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"perkeep.org/internal/lru"
 	"perkeep.org/internal/osutil"
@@ -386,6 +387,8 @@ func (s *storage) Close() error {
 		closeErr = err
 	}
 	if gc { // let those finalizers run that decrement openFds
+		runtime.GC()
+		time.Sleep(100 * time.Millisecond)
 		runtime.GC()
 	}
 	return closeErr
