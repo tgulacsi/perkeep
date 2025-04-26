@@ -151,7 +151,7 @@ func New(dir string) (blobserver.Storage, error) {
 			maxSize = 0
 		}
 	}
-	return newStorage(dir, maxSize, nil)
+	return newStorage(dir, maxSize, 0, nil)
 }
 
 // newIndex returns a new sorted.KeyValue, using either the given config, or the default.
@@ -166,8 +166,11 @@ func newIndex(root string, indexConf jsonconfig.Obj) (sorted.KeyValue, error) {
 }
 
 // newStorage returns a new storage in path root with the given maxFileSize,
-// or defaultMaxFileSize (512MB) if <= 0
-func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *storage, err error) {
+// or defaultMaxFileSize (512MB) if <= 0.
+//
+// fdCacheLimit limits the maximum number of opened (cached) files,
+// with 80% of ulimit -n being the default (fdCacheLimit <= 0).
+func newStorage(root string, maxFileSize int64, fdCacheLimit int, indexConf jsonconfig.Obj) (s *storage, err error) {
 	fi, err := os.Stat(root)
 	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("storage root %q doesn't exist", root)
@@ -193,16 +196,21 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 	// Be consistent with trailing slashes.  Makes expvar stats for total
 	// reads/writes consistent across diskpacked targets, regardless of what
 	// people put in their low level config.
-	ul, _ := osutil.MaxFD()
-	if ul == 0 {
-		ul = 1024
+	if fdCacheLimit <= 0 {
+		ul, _ := osutil.MaxFD()
+		if ul > 0 {
+			fdCacheLimit = int(ul * 80 / 100)
+		}
+	}
+	if fdCacheLimit == 0 {
+		fdCacheLimit = 1024
 	}
 	root = strings.TrimRight(root, `\/`)
 	s = &storage{
 		root:         root,
 		index:        index,
 		maxFileSize:  maxFileSize,
-		fdCache:      lru.NewUnlocked(int(ul * 80 / 100)), // Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
+		fdCache:      lru.NewUnlocked(fdCacheLimit), // Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
 		Generationer: local.NewGenerationer(root),
 	}
 
@@ -227,7 +235,7 @@ func newFromConfig(_ blobserver.Loader, config jsonconfig.Obj) (storage blobserv
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	return newStorage(path, int64(maxFileSize), indexConf)
+	return newStorage(path, int64(maxFileSize), 0, indexConf)
 }
 
 func init() {
@@ -257,7 +265,7 @@ func (s *storage) openForRead(n int) (*os.File, error) {
 		s.fileCount = n + 1
 	}
 	openFdsVar.Add(s.root, 1)
-	debug.Printf("diskpacked: opened for read %q, count=%d", fn, s.fileCount)
+	debug.Printf("diskpacked: opened for read %q, count=%d, cache=%d", fn, s.fileCount, s.fdCache.Len())
 	runtime.SetFinalizer(f, func(f *os.File) {
 		f.Close()
 		openFdsVar.Add(s.root, -1)

@@ -61,7 +61,7 @@ func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) blobserv
 		t.Fatal(err)
 	}
 	t.Logf("diskpacked test dir is %q", dir)
-	s, err := newStorage(dir, 1<<20, indexConf)
+	s, err := newStorage(dir, 512, 3, indexConf)
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestClose(t *testing.T) {
 }
 
 func TestBadDir(t *testing.T) {
-	s, err := newStorage("hopefully this is a not existing directory", 1<<20, jsonconfig.Obj{"type": "memory"})
+	s, err := newStorage("hopefully this is a not existing directory", 1<<20, 1, jsonconfig.Obj{"type": "memory"})
 	if err == nil {
 		s.Close()
 		t.Errorf("expected error for non-existing directory")
@@ -362,7 +362,7 @@ func TestWriteError(t *testing.T) {
 	if err := os.Symlink("/non existing file", fn); err != nil {
 		t.Fatal(err)
 	}
-	s, err := newStorage(dir, 1, jsonconfig.Obj{"type": "memory"})
+	s, err := newStorage(dir, 1, 1, jsonconfig.Obj{"type": "memory"})
 	if err == nil {
 		s.Close()
 		t.Fatal("expected error for non-existing directory")
