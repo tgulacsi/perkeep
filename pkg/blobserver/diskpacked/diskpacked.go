@@ -48,8 +48,8 @@ import (
 	"sync"
 	"time"
 
-	"perkeep.org/internal/lru"
 	"perkeep.org/internal/osutil"
+	"perkeep.org/internal/sieve"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
 	"perkeep.org/pkg/blobserver/local"
@@ -90,7 +90,7 @@ type storage struct {
 	*local.Generationer
 
 	writer      *os.File
-	fdCache     *lru.Cache
+	fdCache     *sieve.Sieve[string, *os.File]
 	root        string
 	maxFileSize int64
 
@@ -210,7 +210,7 @@ func newStorage(root string, maxFileSize int64, fdCacheLimit int, indexConf json
 		root:         root,
 		index:        index,
 		maxFileSize:  maxFileSize,
-		fdCache:      lru.NewUnlocked(fdCacheLimit), // Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
+		fdCache:      sieve.New[string, *os.File](fdCacheLimit), // Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
 		Generationer: local.NewGenerationer(root),
 	}
 
@@ -254,7 +254,7 @@ func (s *storage) openForRead(n int) (*os.File, error) {
 	fn := s.filename(n)
 	if f, ok := s.fdCache.Get(fn); ok {
 		debug.Printf("cache hit for %q", fn)
-		return f.(*os.File), nil
+		return f, nil
 	}
 
 	f, err := os.Open(fn)
@@ -385,7 +385,7 @@ func (s *storage) Close() error {
 		if k == "" {
 			break
 		}
-		err := f.(*os.File).Close()
+		err := f.Close()
 		gc = true
 		if err != nil {
 			closeErr = err
