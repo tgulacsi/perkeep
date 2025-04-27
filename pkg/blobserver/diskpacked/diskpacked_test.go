@@ -65,7 +65,7 @@ func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) blobserv
 		t.Fatal(err)
 	}
 	t.Logf("diskpacked test dir is %q", dir)
-	s, err := newStorage(dir, 512, 3, indexConf)
+	s, err := newStorage(dir, 8192, 3, indexConf)
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
