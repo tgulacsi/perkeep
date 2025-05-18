@@ -18,6 +18,7 @@ package camtypes
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -229,10 +230,25 @@ type BlobMeta struct {
 }
 
 func (bm BlobMeta) MarshalBinary() ([]byte, error) {
-	return json.Marshal(bm)
+	var data []byte
+	data = binary.AppendUvarint(data, uint64(bm.Size))
+	data = binary.AppendUvarint(data, uint64(len(bm.CamliType)))
+	data = append(data, bm.CamliType...)
+	return bm.Ref.AppendBinary(data)
 }
 func (bm *BlobMeta) UnmarshalBinary(p []byte) error {
-	return json.Unmarshal(p, bm)
+	r := bytes.NewReader(p)
+	u, err := binary.ReadUvarint(r)
+	if err != nil {
+		return err
+	}
+	bm.Size = uint32(u)
+	if u, err = binary.ReadUvarint(r); err != nil {
+		return err
+	}
+	off := int(r.Size()) - r.Len()
+	bm.CamliType = schema.CamliType(p[off : off+int(u)])
+	return bm.Ref.UnmarshalBinary(p[off+int(u):])
 }
 
 // SearchErrorResponse is the JSON error response for a search request.

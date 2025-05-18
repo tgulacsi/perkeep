@@ -566,8 +566,9 @@ func (c *Corpus) numSchemaBlobs() (n int64) {
 }
 
 func (c *Corpus) scanPrefix(mu *sync.Mutex, s sorted.KeyValue, prefix string) (err error) {
-	c.blobs.Begin()
-	defer c.blobs.Commit()
+	if prefix == "meta" {
+		defer c.blobs.Commit()
+	}
 
 	typeKey := typeOfKey(prefix)
 	fn, ok := corpusMergeFunc[typeKey]
@@ -1023,7 +1024,6 @@ func (c *Corpus) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
 	// }
 	var errSkip = errors.New("skip")
 	if err := c.blobs.Foreach(func(k blob.Ref, v camtypes.BlobMeta) error {
-		log.Println("EnumerateBlobMeta", v)
 		if !fn(v) {
 			return errSkip
 		}
@@ -1121,14 +1121,12 @@ func (lsp *lazySortedPermanodes) sorted(reverse bool) []pnAndTime {
 }
 
 func (c *Corpus) enumeratePermanodes(fn func(camtypes.BlobMeta) bool, pns []pnAndTime) {
-	log.Println("enumeratePermanodes", pns)
 	for _, cand := range pns {
 		// bm := c.blobs[cand.pn]
 		if bm, ok, err := c.blobs.Get(cand.pn); err != nil {
 			panic(err)
 		} else if !ok {
 			// if bm == nil {
-			log.Println("blob not found", cand.pn)
 			continue
 			// if !fn(*bm) {
 		} else if !fn(bm) {

@@ -21,10 +21,15 @@ import (
 	"errors"
 	"os"
 
+	"perkeep.org/internal/sieve"
 	"perkeep.org/pkg/sorted"
 	"perkeep.org/pkg/sorted/kvfile"
 )
 
+type comparableMarshaler interface {
+	encoding.BinaryMarshaler
+	comparable
+}
 type marshalable[T encoding.BinaryMarshaler] interface {
 	encoding.BinaryUnmarshaler
 	*T
@@ -32,15 +37,17 @@ type marshalable[T encoding.BinaryMarshaler] interface {
 
 const defaultBatchSize = 16 << 10
 
-type kvMap[K encoding.BinaryMarshaler, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V]] struct {
-	kv               sorted.KeyValue
-	batch            sorted.BatchMutation
-	batchKeys        map[string]struct{}
-	length, batchLen uint64
-	batchSize        int
+// kvMap is a map[K]V, eventually (batched in batchSize chunks) stores
+// the map in kvfile (sorted.KeyValue).
+type kvMap[K comparableMarshaler, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V]] struct {
+	kv        sorted.KeyValue
+	m         map[K]V
+	cache     *sieve.Sieve[K, V]
+	length    uint64
+	batchSize int
 }
 
-func newKvMap[K, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V]](file string) (*kvMap[K, V, PK, PV], error) {
+func newKvMap[K comparableMarshaler, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V]](file string) (*kvMap[K, V, PK, PV], error) {
 	var isTemp bool
 	if file == "" {
 		fh, err := os.CreateTemp("", "perkeep-index-*.kvfile")
@@ -60,7 +67,11 @@ func newKvMap[K, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V
 	if isTemp {
 		os.Remove(file)
 	}
-	kvm := &kvMap[K, V, PK, PV]{kv: m, batchSize: defaultBatchSize}
+	kvm := &kvMap[K, V, PK, PV]{
+		kv: m, m: make(map[K]V),
+		cache:     sieve.New[K, V](defaultBatchSize),
+		batchSize: defaultBatchSize,
+	}
 	sorted.Foreach(m, func(_, _ string) error {
 		kvm.length++
 		return nil
@@ -68,24 +79,23 @@ func newKvMap[K, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V
 	return kvm, nil
 }
 
-func (m *kvMap[K, V, PK, PV]) Len() int { return int(m.length) + len(m.batchKeys) }
+func (m *kvMap[K, V, PK, PV]) Len() int { return int(m.length) + len(m.m) }
 
 func (m *kvMap[K, V, PK, PV]) Get(k K) (V, bool, error) {
-	key, err := k.MarshalBinary()
+	if v, ok := m.m[k]; ok {
+		return v, true, nil
+	}
+
+	if v, ok := m.cache.Get(k); ok {
+		return v, true, nil
+	}
+
 	var v V
+	key, err := k.MarshalBinary()
 	if err != nil {
 		return v, false, err
 	}
-	keyS := string(key)
-	if m.batch != nil {
-		if _, ok := m.batchKeys[keyS]; ok {
-			if err = m.Begin(); err != nil {
-				return v, true, err
-			}
-		}
-	}
-
-	val, err := m.kv.Get(keyS)
+	val, err := m.kv.Get(string(key))
 	if err != nil {
 		if errors.Is(err, sorted.ErrNotFound) {
 			return v, false, nil
@@ -98,59 +108,43 @@ func (m *kvMap[K, V, PK, PV]) Get(k K) (V, bool, error) {
 	} else if errors.Is(err, sorted.ErrNotFound) {
 		err = nil
 	}
+	m.cache.Add(k, v)
 	return v, ok, err
 }
 
-func (m *kvMap[K, V, PK, PV]) Begin() error {
-	if err := m.Commit(); err != nil {
-		return err
-	}
-	if m.batchKeys == nil {
-		m.batchKeys = make(map[string]struct{}, m.batchSize)
-	}
-	m.batch = m.kv.BeginBatch()
-	return nil
-}
 func (m *kvMap[K, V, PK, PV]) Commit() error {
-	m.batchLen = 0
-	if m.batchKeys != nil {
-		clear(m.batchKeys)
-	}
-	if m.batch == nil {
+	if len(m.m) == 0 {
 		return nil
 	}
-	err := m.kv.CommitBatch(m.batch)
-	m.batch = nil
-	return err
+	batch := m.kv.BeginBatch()
+	for k, v := range m.m {
+		key, err := k.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		val, err := v.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		batch.Set(string(key), string(val))
+	}
+	clear(m.m)
+	return m.kv.CommitBatch(batch)
 }
 func (m *kvMap[K, V, PK, PV]) Set(k K, v V) error {
-	key, err := k.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	val, err := v.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	if _, err = m.kv.Get(string(key)); errors.Is(err, sorted.ErrNotFound) {
-		m.length++
-	}
-	keyS, valS := string(key), string(val)
-	if m.batch == nil {
-		return m.kv.Set(keyS, valS)
-	}
-	m.batch.Set(keyS, valS)
-	m.batchKeys[keyS] = struct{}{}
-	if len(m.batchKeys) < m.batchSize {
+	m.m[k] = v
+	if len(m.m) < m.batchSize {
 		return nil
 	}
-	if err = m.Commit(); err != nil {
-		return err
-	}
-	return m.Begin()
+	return m.Commit()
 }
 
 func (m *kvMap[K, V, PK, PV]) Foreach(fn func(K, V) error) error {
+	for k, v := range m.m {
+		if err := fn(k, v); err != nil {
+			return err
+		}
+	}
 	return sorted.Foreach(m.kv, func(key, value string) error {
 		var k K
 		if err := PK(&k).UnmarshalBinary([]byte(key)); err != nil {
