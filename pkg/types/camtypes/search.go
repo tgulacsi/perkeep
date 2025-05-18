@@ -18,6 +18,7 @@ package camtypes
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"mime"
@@ -143,6 +144,13 @@ func (fi *FileInfo) IsVideo() bool {
 	}
 
 	return strings.HasPrefix(mime.TypeByExtension(filepath.Ext(fi.FileName)), "video/")
+}
+
+func (fi FileInfo) MarshalBinary() ([]byte, error) {
+	return json.Marshal(fi)
+}
+func (fi *FileInfo) UnmarshalBinary(p []byte) error {
+	return json.Unmarshal(p, fi)
 }
 
 // ImageInfo describes an image file.

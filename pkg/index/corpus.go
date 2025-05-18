@@ -75,8 +75,9 @@ type Corpus struct {
 	keyId signerFromBlobrefMap
 
 	// signerRefs maps a signer GPG ID to all its signer blobs (because different hashes).
-	signerRefs   map[string]SignerRefSet
-	files        map[blob.Ref]camtypes.FileInfo // keyed by file or directory schema blob
+	signerRefs map[string]SignerRefSet
+	// files        map[blob.Ref]camtypes.FileInfo // keyed by file or directory schema blob
+	files        kvMap[blob.Ref, camtypes.FileInfo, *camtypes.FileInfo]
 	permanodes   map[blob.Ref]*PermanodeMeta
 	imageInfo    map[blob.Ref]camtypes.ImageInfo // keyed by fileref (not wholeref)
 	fileWholeRef map[blob.Ref]blob.Ref           // fileref -> its wholeref (TODO: multi-valued?)
@@ -310,9 +311,9 @@ func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
 
 func newCorpus() *Corpus {
 	c := &Corpus{
-		blobs:                   make(map[blob.Ref]*camtypes.BlobMeta),
-		camBlobs:                make(map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta),
-		files:                   make(map[blob.Ref]camtypes.FileInfo),
+		blobs:    make(map[blob.Ref]*camtypes.BlobMeta),
+		camBlobs: make(map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta),
+		// files:                   make(map[blob.Ref]camtypes.FileInfo),
 		permanodes:              make(map[blob.Ref]*PermanodeMeta),
 		imageInfo:               make(map[blob.Ref]camtypes.ImageInfo),
 		deletedBy:               make(map[blob.Ref]blob.Ref),
@@ -335,6 +336,10 @@ func newCorpus() *Corpus {
 	c.permanodesByTime = &lazySortedPermanodes{
 		c:      c,
 		pnTime: c.PermanodeAnyTime,
+	}
+	var err error
+	if c.files, err = newFilesMap(""); err != nil {
+		panic(err)
 	}
 	return c
 }
@@ -424,6 +429,10 @@ func init() {
 	}
 }
 
+func newFilesMap(file string) (kvMap[blob.Ref, camtypes.FileInfo, *camtypes.FileInfo], error) {
+	return newKvMap[blob.Ref, camtypes.FileInfo, *camtypes.FileInfo](file)
+}
+
 func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	c.building = true
 
@@ -448,7 +457,11 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 		return err
 	}
 
-	c.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs[schema.TypeFile]))
+	// sc.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs[schema.TypeFile]))
+	var err error
+	if c.files, err = newFilesMap(""); err != nil {
+		return err
+	}
 	c.permanodes = make(map[blob.Ref]*PermanodeMeta, len(c.camBlobs[schema.TypePermanode]))
 	cpu0 := osutil.CPUUsage()
 
@@ -501,7 +514,7 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 			float64(c.sumBlobBytes)/(1<<30),
 			c.numSchemaBlobs(),
 			len(c.permanodes),
-			len(c.files),
+			c.files.Len(),
 			len(c.imageInfo))
 		c.logf("scanning CPU usage: %v", cpu)
 	}
@@ -817,9 +830,16 @@ func (c *Corpus) mergeFileTimesRow(k, v []byte) error {
 
 func (c *Corpus) mutateFileInfo(br blob.Ref, fn func(*camtypes.FileInfo)) {
 	br = c.br(br)
-	fi := c.files[br] // use zero value if not present
+	// fi := c.files[br] // use zero value if not present
+	fi, _, err := c.files.Get(br) // use zero value if not present
+	if err != nil {
+		panic(err)
+	}
 	fn(&fi)
-	c.files[br] = fi
+	// c.files[br] = fi
+	if err = c.files.Set(br, fi); err != nil {
+		panic(err)
+	}
 }
 
 func (c *Corpus) mergeImageSizeRow(k, v []byte) error {
@@ -1162,7 +1182,11 @@ func (c *Corpus) PermanodeTime(pn blob.Ref) (t time.Time, ok bool) {
 	var fi camtypes.FileInfo
 	ccRef, ccTime, ok := c.pnCamliContent(pn)
 	if ok {
-		fi = c.files[ccRef]
+		// fi = c.files[ccRef]
+		var err error
+		if fi, _, err = c.files.Get(ccRef); err != nil {
+			panic(err)
+		}
 	}
 	if fi.Time != nil {
 		return time.Time(*fi.Time), true
@@ -1402,8 +1426,9 @@ func (c *Corpus) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNo
 }
 
 func (c *Corpus) GetFileInfo(ctx context.Context, fileRef blob.Ref) (fi camtypes.FileInfo, err error) {
-	fi, ok := c.files[fileRef]
-	if !ok {
+	// fi, ok := c.files[fileRef]
+	fi, ok, err := c.files.Get(fileRef)
+	if !ok && err == nil {
 		err = os.ErrNotExist
 	}
 	return
@@ -1414,7 +1439,10 @@ func (c *Corpus) GetFileInfo(ctx context.Context, fileRef blob.Ref) (fi camtypes
 func (c *Corpus) GetDirChildren(ctx context.Context, dirRef blob.Ref) (map[blob.Ref]struct{}, error) {
 	children, ok := c.dirChildren[dirRef]
 	if !ok {
-		if _, ok := c.files[dirRef]; !ok {
+		// if _, ok := c.files[dirRef]; !ok {
+		if _, ok, err := c.files.Get(dirRef); err != nil {
+			return nil, err
+		} else if !ok {
 			return nil, os.ErrNotExist
 		}
 		return nil, nil
@@ -1427,7 +1455,10 @@ func (c *Corpus) GetDirChildren(ctx context.Context, dirRef blob.Ref) (map[blob.
 func (c *Corpus) GetParentDirs(ctx context.Context, childRef blob.Ref) (map[blob.Ref]struct{}, error) {
 	parents, ok := c.fileParents[childRef]
 	if !ok {
-		if _, ok := c.files[childRef]; !ok {
+		// if _, ok := c.files[childRef]; !ok {
+		if _, ok, err := c.files.Get(childRef); err != nil {
+			return nil, err
+		} else if !ok {
 			return nil, os.ErrNotExist
 		}
 		return nil, nil

@@ -42,7 +42,9 @@ func (c *Corpus) Exp_mergeFileInfoRow(k, v string) error {
 }
 
 func (c *Corpus) Exp_files(br blob.Ref) camtypes.FileInfo {
-	return c.files[br]
+	// return c.files[br]
+	fi, _, _ := c.files.Get(br)
+	return fi
 }
 
 func ExpKvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtypes.Claim, ok bool) {
