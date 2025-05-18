@@ -785,6 +785,13 @@ func (r Ref) MarshalBinary() (data []byte, err error) {
 	return
 }
 
+func (r Ref) AppendBinary(data []byte) ([]byte, error) {
+	data = append(data, r.digest.digestName()...)
+	data = append(data, '-')
+	data = append(data, r.digest.bytes()...)
+	return data, nil
+}
+
 // UnmarshalBinary implements Go's encoding.BinaryUnmarshaler interface.
 func (r *Ref) UnmarshalBinary(data []byte) error {
 	if r.digest != nil {

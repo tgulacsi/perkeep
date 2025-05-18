@@ -228,6 +228,13 @@ type BlobMeta struct {
 	// TODO(bradfitz): change CamliTypethis *string to save 8 bytes
 }
 
+func (bm BlobMeta) MarshalBinary() ([]byte, error) {
+	return json.Marshal(bm)
+}
+func (bm *BlobMeta) UnmarshalBinary(p []byte) error {
+	return json.Unmarshal(p, bm)
+}
+
 // SearchErrorResponse is the JSON error response for a search request.
 type SearchErrorResponse struct {
 	Error     string `json:"error,omitempty"`     // The error message.

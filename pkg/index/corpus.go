@@ -64,7 +64,8 @@ type Corpus struct {
 	brOfStr   map[string]blob.Ref // blob.Parse fast path
 	brInterns int64               // blob.Ref -> blob.Ref, via br method
 
-	blobs        map[blob.Ref]*camtypes.BlobMeta
+	// blobs        map[blob.Ref]*camtypes.BlobMeta
+	blobs        *kvMap[blob.Ref, camtypes.BlobMeta, *blob.Ref, *camtypes.BlobMeta]
 	sumBlobBytes int64
 
 	// camBlobs maps from camliType ("file") to blobref to the meta.
@@ -77,7 +78,7 @@ type Corpus struct {
 	// signerRefs maps a signer GPG ID to all its signer blobs (because different hashes).
 	signerRefs map[string]SignerRefSet
 	// files        map[blob.Ref]camtypes.FileInfo // keyed by file or directory schema blob
-	files        kvMap[blob.Ref, camtypes.FileInfo, *camtypes.FileInfo]
+	files        *kvMap[blob.Ref, camtypes.FileInfo, *blob.Ref, *camtypes.FileInfo]
 	permanodes   map[blob.Ref]*PermanodeMeta
 	imageInfo    map[blob.Ref]camtypes.ImageInfo // keyed by fileref (not wholeref)
 	fileWholeRef map[blob.Ref]blob.Ref           // fileref -> its wholeref (TODO: multi-valued?)
@@ -311,7 +312,7 @@ func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
 
 func newCorpus() *Corpus {
 	c := &Corpus{
-		blobs:    make(map[blob.Ref]*camtypes.BlobMeta),
+		// blobs:    make(map[blob.Ref]*camtypes.BlobMeta),
 		camBlobs: make(map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta),
 		// files:                   make(map[blob.Ref]camtypes.FileInfo),
 		permanodes:              make(map[blob.Ref]*PermanodeMeta),
@@ -338,6 +339,9 @@ func newCorpus() *Corpus {
 		pnTime: c.PermanodeAnyTime,
 	}
 	var err error
+	if c.blobs, err = newBlobsMap(""); err != nil {
+		panic(err)
+	}
 	if c.files, err = newFilesMap(""); err != nil {
 		panic(err)
 	}
@@ -429,8 +433,12 @@ func init() {
 	}
 }
 
-func newFilesMap(file string) (kvMap[blob.Ref, camtypes.FileInfo, *camtypes.FileInfo], error) {
-	return newKvMap[blob.Ref, camtypes.FileInfo, *camtypes.FileInfo](file)
+func newBlobsMap(file string) (*kvMap[blob.Ref, camtypes.BlobMeta, *blob.Ref, *camtypes.BlobMeta], error) {
+	return newKvMap[blob.Ref, camtypes.BlobMeta, *blob.Ref, *camtypes.BlobMeta](file)
+}
+
+func newFilesMap(file string) (*kvMap[blob.Ref, camtypes.FileInfo, *blob.Ref, *camtypes.FileInfo], error) {
+	return newKvMap[blob.Ref, camtypes.FileInfo, *blob.Ref, *camtypes.FileInfo](file)
 }
 
 func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
@@ -445,6 +453,18 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 
 	scanmu := new(sync.Mutex)
 
+	var err error
+	if c.blobs == nil {
+		if c.blobs, err = newBlobsMap(""); err != nil {
+			return err
+		}
+	}
+	if c.files == nil {
+		if c.files, err = newFilesMap(""); err != nil {
+			return err
+		}
+	}
+
 	// We do the "meta" rows first, before the prefixes below, because it
 	// populates the blobs map (used for blobref interning) and the camBlobs
 	// map (used for hinting the size of other maps)
@@ -458,10 +478,6 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 	}
 
 	// sc.files = make(map[blob.Ref]camtypes.FileInfo, len(c.camBlobs[schema.TypeFile]))
-	var err error
-	if c.files, err = newFilesMap(""); err != nil {
-		return err
-	}
 	c.permanodes = make(map[blob.Ref]*PermanodeMeta, len(c.camBlobs[schema.TypePermanode]))
 	cpu0 := osutil.CPUUsage()
 
@@ -510,7 +526,7 @@ func (c *Corpus) scanFromStorage(s sorted.KeyValue) error {
 		}
 		c.logf("stats: %.3f MiB mem: %d blobs (%.3f GiB) (%d schema (%d permanode, %d file (%d image), ...)",
 			float64(memUsed)/(1<<20),
-			len(c.blobs),
+			c.blobs.Len(), // len(c.blobs),
 			float64(c.sumBlobBytes)/(1<<30),
 			c.numSchemaBlobs(),
 			len(c.permanodes),
@@ -550,6 +566,9 @@ func (c *Corpus) numSchemaBlobs() (n int64) {
 }
 
 func (c *Corpus) scanPrefix(mu *sync.Mutex, s sorted.KeyValue, prefix string) (err error) {
+	c.blobs.Begin()
+	defer c.blobs.Commit()
+
 	typeKey := typeOfKey(prefix)
 	fn, ok := corpusMergeFunc[typeKey]
 	if !ok {
@@ -607,7 +626,10 @@ func (c *Corpus) addKeyID(mm *mutationMap) error {
 }
 
 func (c *Corpus) addBlob(ctx context.Context, br blob.Ref, mm *mutationMap) error {
-	if _, dup := c.blobs[br]; dup {
+	// if _, dup := c.blobs[br]; dup {
+	if _, dup, err := c.blobs.Get(br); err != nil {
+		return err
+	} else if dup {
 		return nil
 	}
 	c.gen++
@@ -670,12 +692,18 @@ func (c *Corpus) mergeMetaRow(k, v []byte) error {
 }
 
 func (c *Corpus) mergeBlobMeta(bm camtypes.BlobMeta) error {
-	if _, dup := c.blobs[bm.Ref]; dup {
+	// if _, dup := c.blobs[bm.Ref]; dup {
+	if _, dup, err := c.blobs.Get(bm.Ref); err != nil {
+		return err
+	} else if dup {
 		panic("dup blob seen")
 	}
 	bm.CamliType = schema.CamliType((c.str(string(bm.CamliType))))
 
-	c.blobs[bm.Ref] = &bm
+	// c.blobs[bm.Ref] = &bm
+	if err := c.blobs.Set(bm.Ref, bm); err != nil {
+		return err
+	}
 	c.sumBlobBytes += int64(bm.Size)
 	if bm.CamliType != "" {
 		m, ok := c.camBlobs[bm.CamliType]
@@ -951,10 +979,10 @@ func (c *Corpus) str(s string) string {
 
 // br returns br, interned.
 func (c *Corpus) br(br blob.Ref) blob.Ref {
-	if bm, ok := c.blobs[br]; ok {
-		c.brInterns++
-		return bm.Ref
-	}
+	// if bm, ok := c.blobs[br]; ok {
+	// 	c.brInterns++
+	// 	return bm.Ref
+	// }
 	return br
 }
 
@@ -988,10 +1016,20 @@ func (c *Corpus) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.
 // order.
 // If fn returns false, iteration ends.
 func (c *Corpus) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
-	for _, bm := range c.blobs {
-		if !fn(*bm) {
-			return
+	// for _, bm := range c.blobs {
+	// 	if !fn(*bm) {
+	// 		return
+	// 	}
+	// }
+	var errSkip = errors.New("skip")
+	if err := c.blobs.Foreach(func(k blob.Ref, v camtypes.BlobMeta) error {
+		log.Println("EnumerateBlobMeta", v)
+		if !fn(v) {
+			return errSkip
 		}
+		return nil
+	}); err != nil && err != errSkip {
+		panic(err)
 	}
 }
 
@@ -1083,12 +1121,17 @@ func (lsp *lazySortedPermanodes) sorted(reverse bool) []pnAndTime {
 }
 
 func (c *Corpus) enumeratePermanodes(fn func(camtypes.BlobMeta) bool, pns []pnAndTime) {
+	log.Println("enumeratePermanodes", pns)
 	for _, cand := range pns {
-		bm := c.blobs[cand.pn]
-		if bm == nil {
+		// bm := c.blobs[cand.pn]
+		if bm, ok, err := c.blobs.Get(cand.pn); err != nil {
+			panic(err)
+		} else if !ok {
+			// if bm == nil {
+			log.Println("blob not found", cand.pn)
 			continue
-		}
-		if !fn(*bm) {
+			// if !fn(*bm) {
+		} else if !fn(bm) {
 			return
 		}
 	}
@@ -1110,8 +1153,12 @@ func (c *Corpus) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, new
 
 // EnumerateSingleBlob calls fn with br's BlobMeta if br exists in the corpus.
 func (c *Corpus) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.Ref) {
-	if bm := c.blobs[br]; bm != nil {
-		fn(*bm)
+	// if bm := c.blobs[br]; bm != nil {
+	if bm, ok, err := c.blobs.Get(br); err != nil {
+		panic(err)
+	} else if ok {
+		// fn(*bm)
+		fn(bm)
 	}
 }
 
@@ -1122,8 +1169,12 @@ func (c *Corpus) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool,
 	for _, t := range camliNodeTypes {
 		set := c.permanodesSetByNodeType[t]
 		for br := range set {
-			if bm := c.blobs[br]; bm != nil {
-				if !fn(*bm) {
+			// if bm := c.blobs[br]; bm != nil {
+			if bm, ok, err := c.blobs.Get(br); err != nil {
+				panic(err)
+			} else if ok {
+				// if !fn(*bm) {
+				if !fn(bm) {
 					return
 				}
 			}
@@ -1132,11 +1183,16 @@ func (c *Corpus) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool,
 }
 
 func (c *Corpus) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
-	bm, ok := c.blobs[br]
+	// bm, ok := c.blobs[br]
+	bm, ok, err := c.blobs.Get(br)
+	if err != nil {
+		return camtypes.BlobMeta{}, err
+	}
 	if !ok {
 		return camtypes.BlobMeta{}, os.ErrNotExist
 	}
-	return *bm, nil
+	// return *bm, nil
+	return bm, nil
 }
 
 func (c *Corpus) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
