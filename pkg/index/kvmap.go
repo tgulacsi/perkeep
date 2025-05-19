@@ -136,6 +136,14 @@ func (kvm *kvMap[K, V, PK, PV]) Start() {
 			}(); err != nil {
 				if err == errFinished {
 					log.Printf("moved %d in %s", moved, time.Since(start))
+					// shrink
+					kvm.mu.Lock()
+					m = make(map[K]V, len(kvm.m))
+					for k, v := range kvm.m {
+						m[k] = v
+					}
+					kvm.m = m
+					defer kvm.mu.Unlock()
 					return
 				}
 				log.Println(err)
