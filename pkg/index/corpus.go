@@ -566,8 +566,8 @@ func (c *Corpus) numSchemaBlobs() (n int64) {
 }
 
 func (c *Corpus) scanPrefix(mu *sync.Mutex, s sorted.KeyValue, prefix string) (err error) {
-	if prefix == "meta" {
-		defer c.blobs.Commit()
+	if prefix == "meta:" {
+		defer c.blobs.Start()
 	}
 
 	typeKey := typeOfKey(prefix)

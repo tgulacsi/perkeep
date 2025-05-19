@@ -19,9 +19,11 @@ package index
 import (
 	"encoding"
 	"errors"
+	"log"
 	"os"
+	"sync"
+	"time"
 
-	"perkeep.org/internal/sieve"
 	"perkeep.org/pkg/sorted"
 	"perkeep.org/pkg/sorted/kvfile"
 )
@@ -40,11 +42,10 @@ const defaultBatchSize = 16 << 10
 // kvMap is a map[K]V, eventually (batched in batchSize chunks) stores
 // the map in kvfile (sorted.KeyValue).
 type kvMap[K comparableMarshaler, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V]] struct {
-	kv        sorted.KeyValue
-	m         map[K]V
-	cache     *sieve.Sieve[K, V]
-	length    uint64
-	batchSize int
+	kv     sorted.KeyValue
+	mu     sync.RWMutex
+	m      map[K]V
+	length uint64
 }
 
 func newKvMap[K comparableMarshaler, V encoding.BinaryMarshaler, PK marshalable[K], PV marshalable[V]](file string) (*kvMap[K, V, PK, PV], error) {
@@ -69,28 +70,100 @@ func newKvMap[K comparableMarshaler, V encoding.BinaryMarshaler, PK marshalable[
 	}
 	kvm := &kvMap[K, V, PK, PV]{
 		kv: m, m: make(map[K]V),
-		cache:     sieve.New[K, V](defaultBatchSize),
-		batchSize: defaultBatchSize,
 	}
 	sorted.Foreach(m, func(_, _ string) error {
 		kvm.length++
 		return nil
 	})
+	// Shovel the contents of kvm.m into the sorted.KeyValue
 	return kvm, nil
 }
 
-func (m *kvMap[K, V, PK, PV]) Len() int { return int(m.length) + len(m.m) }
+// Start the goroutine that will slowly move data from the map[K]V
+// to the sorted.KeyValue.
+//
+// It does it in small chunks with minimal locking.
+func (kvm *kvMap[K, V, PK, PV]) Start() {
+	go func() {
+		m := make(map[K]V)
+		errFinished := errors.New("finished")
+		start := time.Now()
+		var moved int
+		for {
+			if err := func() error {
+				// Save map, avoid long locking
+				kvm.mu.RLock()
+				clear(m)
+				for k, v := range kvm.m {
+					m[k] = v
+					if len(m) >= 16<<10 {
+						break
+					}
+				}
+				kvm.mu.RUnlock()
+				if len(m) == 0 {
+					return errFinished
+				}
+				// start = time.Now()
+				batch := kvm.kv.BeginBatch()
+				for k, v := range m {
+					key, err := k.MarshalBinary()
+					if err != nil {
+						log.Printf("marshal %v: %+v", k, err)
+						continue
+					}
+					val, err := v.MarshalBinary()
+					if err != nil {
+						log.Printf("marshal %v: %+v", v, err)
+						continue
+					}
+					batch.Set(string(key), string(val))
+				}
+				if err := kvm.kv.CommitBatch(batch); err != nil {
+					log.Printf("CommitBatch: %+v", err)
+					return err
+				}
+
+				kvm.mu.Lock()
+				for k := range m {
+					delete(kvm.m, k)
+				}
+				kvm.mu.Unlock()
+				moved += len(m)
+				clear(m)
+				time.Sleep(100 * time.Millisecond)
+				return nil
+			}(); err != nil {
+				if err == errFinished {
+					log.Printf("moved %d in %s", moved, time.Since(start))
+					return
+				}
+				log.Println(err)
+			}
+		}
+	}()
+}
+
+type kvPair[K, V any] struct {
+	k K
+	v V
+}
+
+func (m *kvMap[K, V, PK, PV]) Len() int {
+	m.mu.RLock()
+	n := int(m.length) + len(m.m)
+	m.mu.RUnlock()
+	return n
+}
 
 func (m *kvMap[K, V, PK, PV]) Get(k K) (V, bool, error) {
-	if v, ok := m.m[k]; ok {
+	m.mu.RLock()
+	v, ok := m.m[k]
+	m.mu.RUnlock()
+	if ok {
 		return v, true, nil
 	}
 
-	if v, ok := m.cache.Get(k); ok {
-		return v, true, nil
-	}
-
-	var v V
 	key, err := k.MarshalBinary()
 	if err != nil {
 		return v, false, err
@@ -102,44 +175,24 @@ func (m *kvMap[K, V, PK, PV]) Get(k K) (V, bool, error) {
 		}
 		return v, false, err
 	}
-	var ok bool
 	if err = (PV(&v)).UnmarshalBinary([]byte(val)); err == nil {
 		ok = true
 	} else if errors.Is(err, sorted.ErrNotFound) {
 		err = nil
 	}
-	m.cache.Add(k, v)
 	return v, ok, err
 }
 
-func (m *kvMap[K, V, PK, PV]) Commit() error {
-	if len(m.m) == 0 {
-		return nil
-	}
-	batch := m.kv.BeginBatch()
-	for k, v := range m.m {
-		key, err := k.MarshalBinary()
-		if err != nil {
-			return err
-		}
-		val, err := v.MarshalBinary()
-		if err != nil {
-			return err
-		}
-		batch.Set(string(key), string(val))
-	}
-	clear(m.m)
-	return m.kv.CommitBatch(batch)
-}
 func (m *kvMap[K, V, PK, PV]) Set(k K, v V) error {
+	m.mu.Lock()
 	m.m[k] = v
-	if len(m.m) < m.batchSize {
-		return nil
-	}
-	return m.Commit()
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *kvMap[K, V, PK, PV]) Foreach(fn func(K, V) error) error {
+	m.mu.RUnlock()
+	defer m.mu.RUnlock()
 	for k, v := range m.m {
 		if err := fn(k, v); err != nil {
 			return err
