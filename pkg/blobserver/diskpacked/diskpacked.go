@@ -43,10 +43,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"perkeep.org/internal/osutil"
 	"perkeep.org/internal/sieve"
@@ -207,10 +205,18 @@ func newStorage(root string, maxFileSize int64, fdCacheLimit int, indexConf json
 	}
 	root = strings.TrimRight(root, `\/`)
 	s = &storage{
-		root:         root,
-		index:        index,
-		maxFileSize:  maxFileSize,
-		fdCache:      sieve.New[string, *os.File](fdCacheLimit), // Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
+		root:        root,
+		index:       index,
+		maxFileSize: maxFileSize,
+		fdCache: sieve.New[string, *os.File](
+			fdCacheLimit, // Setting the gate to 80% of the ulimit, to leave a bit of room for other file ops happening in Perkeep.
+			func(fh *os.File) {
+				if fh != nil {
+					fh.Close()
+					openFdsVar.Add(s.root, -1)
+				}
+			},
+		),
 		Generationer: local.NewGenerationer(root),
 	}
 
@@ -266,10 +272,6 @@ func (s *storage) openForRead(n int) (*os.File, error) {
 	}
 	openFdsVar.Add(s.root, 1)
 	debug.Printf("diskpacked: opened for read %q, count=%d, cache=%d", fn, s.fileCount, s.fdCache.Len())
-	runtime.SetFinalizer(f, func(f *os.File) {
-		f.Close()
-		openFdsVar.Add(s.root, -1)
-	})
 	s.fdCache.Add(fn, f)
 	return f, nil
 }
@@ -379,25 +381,14 @@ func (s *storage) Close() error {
 		log.Println("diskpacked: closing index:", err)
 	}
 
-	var gc bool
 	for {
-		k, f := s.fdCache.RemoveOldest()
+		k, _ := s.fdCache.RemoveOldest()
 		if k == "" {
 			break
-		}
-		err := f.Close()
-		gc = true
-		if err != nil {
-			closeErr = err
 		}
 	}
 	if err := s.closePack(); err != nil && closeErr == nil {
 		closeErr = err
-	}
-	if gc { // let those finalizers run that decrement openFds
-		runtime.GC()
-		time.Sleep(100 * time.Millisecond)
-		runtime.GC()
 	}
 	return closeErr
 }

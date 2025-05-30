@@ -390,7 +390,11 @@ func BenchmarkCacheLRU(b *testing.B) {
 		})
 }
 func BenchmarkCacheSIEVE(b *testing.B) {
-	c := sieve.New[string, *os.File](1024)
+	c := sieve.New[string, *os.File](1024, func(fh *os.File) {
+		if fh != nil {
+			fh.Close()
+		}
+	})
 	benchmarkCache(b,
 		func(k string, v *os.File) { c.Add(k, v) },
 		c.Get)

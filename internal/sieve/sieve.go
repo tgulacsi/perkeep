@@ -57,15 +57,17 @@ type Sieve[K comparable, V any] struct {
 	size     int
 	capacity int
 
-	pool *syncPool[node[K, V]]
+	pool     *syncPool[node[K, V]]
+	removeCB func(V)
 }
 
 // New creates a new cache of size 'capacity' mapping key 'K' to value 'V'
-func New[K comparable, V any](capacity int) *Sieve[K, V] {
+func New[K comparable, V any](capacity int, removeCB func(V)) *Sieve[K, V] {
 	s := &Sieve[K, V]{
 		cache:    newSyncMap[K, *node[K, V]](),
 		capacity: capacity,
 		pool:     newSyncPool[node[K, V]](),
+		removeCB: removeCB,
 	}
 	return s
 }
@@ -116,13 +118,6 @@ func (s *Sieve[K, V]) RemoveOldest() (k K, v V) {
 		k, v = n.key, n.val
 	}
 	return
-}
-
-// Reset resets the cache
-func (s *Sieve[K, V]) Reset() {
-	s.cache = newSyncMap[K, *node[K, V]]()
-	s.head = nil
-	s.tail = nil
 }
 
 // Len returns the current cache utilization
@@ -211,6 +206,9 @@ func (s *Sieve[K, V]) remove(n *node[K, V]) {
 	}
 
 	s.pool.Put(n)
+	if s.removeCB != nil {
+		s.removeCB(n.val)
+	}
 }
 
 func (s *Sieve[K, V]) newNode(key K, val V) *node[K, V] {
