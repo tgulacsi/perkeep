@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package fs
+package p9
 
 import (
 	"context"
-	"io/fs"
 	"log"
 	"os"
 	"sync"
@@ -30,7 +29,7 @@ import (
 // CamliFilesystem with a little hello message and the ability to
 // search and browse static snapshots, etc.
 type root struct {
-	fs *PkFileSystem
+	fs *pkP9FS
 
 	mu sync.Mutex
 	// recent      *recentDir
@@ -38,36 +37,6 @@ type root struct {
 	// atDir       *atDir
 	// versionsDir *versionsDir
 }
-
-var (
-	_ fs.FS        = (*root)(nil)
-	_ fs.ReadDirFS = (*root)(nil)
-	_ fs.StatFS    = (*root)(nil)
-)
-
-// Open opens the named file.
-// [File.Close] must be called to release any associated resources.
-//
-// When Open returns an error, it should be of type *PathError
-// with the Op field set to "open", the Path field set to name,
-// and the Err field describing the problem.
-//
-// Open should reject attempts to open names that do not satisfy
-// ValidPath(name), returning a *PathError with Err set to
-// ErrInvalid or ErrNotExist.
-func (n *root) Open(name string) (fs.File, error) {
-
-}
-
-// ReadDir reads the named directory
-// and returns a list of directory entries sorted by filename.
-func (n *root) ReadDir(name string) ([]fs.DirEntry, error) {
-
-}
-
-// Stat returns a FileInfo describing the file.
-// If there is an error, it should be of type *PathError.
-func (n *root) Stat(name string) (fs.FileInfo, error) {}
 
 func (n *root) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = os.ModeDir | 0700

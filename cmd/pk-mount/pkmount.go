@@ -37,7 +37,7 @@ import (
 	"perkeep.org/pkg/cacher"
 	"perkeep.org/pkg/client"
 	"perkeep.org/pkg/cmdmain"
-	"perkeep.org/pkg/fs"
+	fs "perkeep.org/pkg/fs/fuse"
 	"perkeep.org/pkg/search"
 
 	"bazil.org/fuse"

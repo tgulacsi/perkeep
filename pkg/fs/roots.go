@@ -1,5 +1,3 @@
-//go:build linux
-
 /*
 Copyright 2012 The Perkeep Authors
 
@@ -20,176 +18,57 @@ package fs
 
 import (
 	"context"
+	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
 	"go4.org/syncutil"
 	"perkeep.org/pkg/blob"
-	"perkeep.org/pkg/schema"
 	"perkeep.org/pkg/search"
 )
 
 const refreshTime = 1 * time.Minute
 
 type rootsDir struct {
-	fs *CamliFileSystem
+	fs *PkFileSystem
 	at time.Time
 
 	mu        sync.Mutex // guards following
 	lastQuery time.Time
 	m         map[string]blob.Ref // ent name => permanode
-	children  map[string]fs.Node  // ent name => child node
+	children  map[string]fs.File  // ent name => child node
 }
 
 var (
-	_ fs.Node               = (*rootsDir)(nil)
-	_ fs.HandleReadDirAller = (*rootsDir)(nil)
-	_ fs.NodeRemover        = (*rootsDir)(nil)
-	_ fs.NodeRenamer        = (*rootsDir)(nil)
-	_ fs.NodeStringLookuper = (*rootsDir)(nil)
-	_ fs.NodeMkdirer        = (*rootsDir)(nil)
+	_ fs.FS     = (*rootsDir)(nil)
+	_ fs.StatFS = (*rootsDir)(nil)
 )
 
-func (n *rootsDir) isRO() bool {
-	return !n.at.IsZero()
-}
-
-func (n *rootsDir) dirMode() os.FileMode {
-	if n.isRO() {
-		return 0500
-	}
-	return 0700
-}
-
-func (n *rootsDir) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Mode = os.ModeDir | n.dirMode()
-	a.Uid = uint32(os.Getuid())
-	a.Gid = uint32(os.Getgid())
-	return nil
-}
-
-func (n *rootsDir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.condRefresh(ctx); err != nil {
-		return nil, handleEIOorEINTR(err)
-	}
-	var ents []fuse.Dirent
-	for name := range n.m {
-		ents = append(ents, fuse.Dirent{Name: name})
-	}
-	Logger.Printf("rootsDir.ReadDirAll() -> %v", ents)
-	return ents, nil
-}
-
-func (n *rootsDir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
-	if n.isRO() {
-		return fuse.EPERM
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if err := n.condRefresh(ctx); err != nil {
-		return handleEIOorEINTR(err)
-	}
-	br := n.m[req.Name]
-	if !br.Valid() {
-		return fuse.ENOENT
-	}
-
-	claim := schema.NewDelAttributeClaim(br, "camliRoot", "")
-	_, err := n.fs.client.UploadAndSignBlob(ctx, claim)
-	if err != nil {
-		Logger.Println("rootsDir.Remove:", err)
-		return handleEIOorEINTR(err)
-	}
-
-	delete(n.m, req.Name)
-	delete(n.children, req.Name)
-
-	return nil
-}
-
-func (n *rootsDir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
-	Logger.Printf("rootsDir.Rename %q -> %q", req.OldName, req.NewName)
-	if n.isRO() {
-		return fuse.EPERM
-	}
-
-	n.mu.Lock()
-	target, exists := n.m[req.OldName]
-	_, collision := n.m[req.NewName]
-	n.mu.Unlock()
-	if !exists {
-		Logger.Printf("*rootsDir.Rename src name %q isn't known", req.OldName)
-		return fuse.ENOENT
-	}
-	if collision {
-		Logger.Printf("*rootsDir.Rename dest %q already exists", req.NewName)
-		return fuse.EIO
-	}
-
-	// Don't allow renames if the root contains content.  Rename
-	// is mostly implemented to make GUIs that create directories
-	// before asking for the directory name.
-	res, err := n.fs.client.Describe(ctx, &search.DescribeRequest{BlobRef: target})
-	if err != nil {
-		Logger.Println("rootsDir.Rename:", err)
-		return handleEIOorEINTR(err)
-	}
-	db := res.Meta[target.String()]
-	if db == nil {
-		Logger.Printf("Failed to pull meta for target: %v", target)
-		return fuse.EIO
-	}
-
-	for k := range db.Permanode.Attr {
-		const p = "camliPath:"
-		if strings.HasPrefix(k, p) {
-			Logger.Printf("Found file in %q: %q, disallowing rename", req.OldName, k[len(p):])
-			return fuse.EIO
-		}
-	}
-
-	claim := schema.NewSetAttributeClaim(target, "camliRoot", req.NewName)
-	_, err = n.fs.client.UploadAndSignBlob(ctx, claim)
-	if err != nil {
-		Logger.Printf("Upload rename link error: %v", err)
-		return handleEIOorEINTR(err)
-	}
-
-	// Comment transplanted from mutDir.Rename
-	// TODO(bradfitz): this locking would be racy, if the kernel
-	// doesn't do it properly. (It should) Let's just trust the
-	// kernel for now. Later we can verify and remove this
-	// comment.
-	n.mu.Lock()
-	if n.m[req.OldName] != target {
-		panic("Race.")
-	}
-	delete(n.m, req.OldName)
-	delete(n.children, req.OldName)
-	delete(n.children, req.NewName)
-	n.m[req.NewName] = target
-	n.mu.Unlock()
-
-	return nil
-}
-
-func (n *rootsDir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+// Open opens the named file.
+// [File.Close] must be called to release any associated resources.
+//
+// When Open returns an error, it should be of type *PathError
+// with the Op field set to "open", the Path field set to name,
+// and the Err field describing the problem.
+//
+// Open should reject attempts to open names that do not satisfy
+// ValidPath(name), returning a *PathError with Err set to
+// ErrInvalid or ErrNotExist.
+func (n *rootsDir) Open(name string) (fs.File, error) {
 	Logger.Printf("fs.roots: Lookup(%q)", name)
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	ctx, cancel := context.WithTimeout(n.fs.Context(), time.Minute)
+	defer cancel()
 	if err := n.condRefresh(ctx); err != nil {
-		return nil, handleEIOorEINTR(err)
+		return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 	}
 	br := n.m[name]
 	if !br.Valid() {
-		return nil, fuse.ENOENT
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
 	}
 
 	nod, ok := n.children[name]
@@ -197,21 +76,19 @@ func (n *rootsDir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		return nod, nil
 	}
 
-	if n.isRO() {
-		nod = newRODir(n.fs, br, name, n.at)
-	} else {
-		nod = &mutDir{
-			fs:        n.fs,
-			permanode: br,
-			name:      name,
-			xattrs:    make(map[string][]byte),
-			children:  make(map[string]mutFileOrDir),
-		}
-	}
+	nod = newRODir(n.fs, br, name, n.at)
 	n.children[name] = nod
 
 	return nod, nil
 }
+
+// Stat returns a FileInfo describing the file.
+// If there is an error, it should be of type *PathError.
+func (n *rootsDir) Stat(name string) (fs.FileInfo, error) {
+	return n.children[name]
+}
+
+func (n *rootsDir) dirMode() os.FileMode { return 0500 }
 
 // requires n.mu is held
 func (n *rootsDir) condRefresh(ctx context.Context) error {
@@ -238,7 +115,7 @@ func (n *rootsDir) condRefresh(ctx context.Context) error {
 
 	n.m = make(map[string]blob.Ref)
 	if n.children == nil {
-		n.children = make(map[string]fs.Node)
+		n.children = make(map[string]fs.File)
 	}
 
 	dr := &search.DescribeRequest{
@@ -298,50 +175,4 @@ func (n *rootsDir) condRefresh(ctx context.Context) error {
 
 	n.lastQuery = time.Now()
 	return nil
-}
-
-func (n *rootsDir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	if n.isRO() {
-		return nil, fuse.EPERM
-	}
-
-	name := req.Name
-
-	// Create a Permanode for the root.
-	pr, err := n.fs.client.UploadNewPermanode(ctx)
-	if err != nil {
-		Logger.Printf("rootsDir.Create(%q): %v", name, err)
-		return nil, handleEIOorEINTR(err)
-	}
-
-	var grp syncutil.Group
-	// Add a camliRoot attribute to the root permanode.
-	grp.Go(func() (err error) {
-		claim := schema.NewSetAttributeClaim(pr.BlobRef, "camliRoot", name)
-		_, err = n.fs.client.UploadAndSignBlob(ctx, claim)
-		return
-	})
-	// Set the title of the root permanode to the root name.
-	grp.Go(func() (err error) {
-		claim := schema.NewSetAttributeClaim(pr.BlobRef, "title", name)
-		_, err = n.fs.client.UploadAndSignBlob(ctx, claim)
-		return
-	})
-	if err := grp.Err(); err != nil {
-		Logger.Printf("rootsDir.Create(%q): %v", name, err)
-		return nil, handleEIOorEINTR(err)
-	}
-
-	nod := &mutDir{
-		fs:        n.fs,
-		permanode: pr.BlobRef,
-		name:      name,
-		xattrs:    make(map[string][]byte),
-		children:  make(map[string]mutFileOrDir),
-	}
-	n.mu.Lock()
-	n.m[name] = pr.BlobRef
-	n.mu.Unlock()
-
-	return nod, nil
 }

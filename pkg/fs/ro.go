@@ -1,5 +1,3 @@
-//go:build linux
-
 /*
 Copyright 2013 The Perkeep Authors
 
@@ -22,14 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
 	"go4.org/types"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/schema"
@@ -39,7 +36,7 @@ import (
 // roDir is a read-only directory.
 // Its permanode is the permanode with camliPath:entname attributes.
 type roDir struct {
-	fs        *CamliFileSystem
+	fs        *PkFileSystem
 	permanode blob.Ref
 	parent    *roDir // or nil, if the root within its roots.go root.
 	name      string // ent name (base name within parent)
@@ -47,15 +44,16 @@ type roDir struct {
 
 	mu       sync.Mutex
 	children map[string]roFileOrDir
-	xattrs   map[string][]byte
+	// xattrs   map[string][]byte
 }
 
-var _ fs.Node = (*roDir)(nil)
-var _ fs.HandleReadDirAller = (*roDir)(nil)
-var _ fs.NodeGetxattrer = (*roDir)(nil)
-var _ fs.NodeListxattrer = (*roDir)(nil)
+var (
+	_ fs.FS        = (*roDir)(nil)
+	_ fs.ReadDirFS = (*roDir)(nil)
+	_ roFileOrDir  = (*roDir)(nil)
+)
 
-func newRODir(fs *CamliFileSystem, permanode blob.Ref, name string, at time.Time) *roDir {
+func newRODir(fs *PkFileSystem, permanode blob.Ref, name string, at time.Time) *roDir {
 	return &roDir{
 		fs:        fs,
 		permanode: permanode,
@@ -72,14 +70,32 @@ func (n *roDir) fullPath() string {
 	return filepath.Join(n.parent.fullPath(), n.name)
 }
 
-func (n *roDir) Attr(ctx context.Context, a *fuse.Attr) error {
-	*a = fuse.Attr{
-		Inode: n.permanode.Sum64(),
-		Mode:  os.ModeDir | 0500,
-		Uid:   uint32(os.Getuid()),
-		Gid:   uint32(os.Getgid()),
+func (n *roDir) Close() error  { return nil }
+func (n *roDir) Ref() blob.Ref { return n.permanode }
+func (n *roDir) Stat() (fs.FileInfo, error) {
+	return fileInfo{
+		mode: os.ModeDir | 0500,
+	}, nil
+}
+func (n *roDir) Read(_ []byte) (int, error) { return 0, fs.ErrInvalid }
+
+// ReadDir reads the named directory
+// and returns a list of directory entries sorted by filename.
+func (n *roDir) ReadDir(name string) ([]fs.DirEntry, error) {
+	ctx, cancel := context.WithTimeout(n.fs.Context(), time.Minute)
+	defer cancel()
+	err := n.populate(ctx)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var ents []fs.DirEntry
+	for _, childNode := range n.children {
+		fi, err := childNode.Stat()
+		if err != nil {
+			return ents, err
+		}
+		ents = append(ents, fi.(fileInfo))
 	}
-	return nil
+	return ents, err
 }
 
 // populate hits the blobstore to populate map of child nodes.
@@ -164,108 +180,68 @@ func (n *roDir) populate(ctx context.Context) error {
 			// unknown type
 			continue
 		}
-		n.children[name].xattr().load(child.Permanode)
+		// n.children[name].xattr().load(child.Permanode)
 	}
 	return nil
 }
 
-func (n *roDir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	if err := n.populate(ctx); err != nil {
-		Logger.Println("populate:", err)
-		return nil, handleEIOorEINTR(err)
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	var ents []fuse.Dirent
-	for name, childNode := range n.children {
-		var ino uint64
-		switch v := childNode.(type) {
-		case *roDir:
-			ino = v.permanode.Sum64()
-		case *roFile:
-			ino = v.permanode.Sum64()
-		default:
-			Logger.Printf("roDir.ReadDirAll: unknown child type %T", childNode)
-		}
-
-		// TODO: figure out what Dirent.Type means.
-		// fuse.go says "Type uint32 // ?"
-		dirent := fuse.Dirent{
-			Name:  name,
-			Inode: ino,
-		}
-		Logger.Printf("roDir(%q) appending inode %x, %+v", n.fullPath(), dirent.Inode, dirent)
-		ents = append(ents, dirent)
-	}
-	return ents, nil
-}
-
-var _ fs.NodeStringLookuper = (*roDir)(nil)
-
-func (n *roDir) Lookup(ctx context.Context, name string) (ret fs.Node, err error) {
+// Open opens the named file.
+// [File.Close] must be called to release any associated resources.
+//
+// When Open returns an error, it should be of type *PathError
+// with the Op field set to "open", the Path field set to name,
+// and the Err field describing the problem.
+//
+// Open should reject attempts to open names that do not satisfy
+// ValidPath(name), returning a *PathError with Err set to
+// ErrInvalid or ErrNotExist.
+func (n *roDir) Open(name string) (ret fs.File, err error) {
 	defer func() {
 		Logger.Printf("roDir(%q).Lookup(%q) = %#v, %v", n.fullPath(), name, ret, err)
 	}()
+	ctx, cancel := context.WithTimeout(n.fs.Context(), time.Minute)
+	defer cancel()
 	if err := n.populate(ctx); err != nil {
 		Logger.Println("populate:", err)
-		return nil, handleEIOorEINTR(err)
+		return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n2 := n.children[name]; n2 != nil {
+		if f, ok := n2.(*roFile); ok {
+			if f.reader == nil {
+				if f.reader, err = schema.NewFileReader(ctx, f.fs.fetcher, f.content); err != nil {
+					return nil, &fs.PathError{Op: "open", Path: name, Err: err}
+				}
+			}
+		}
+
 		return n2, nil
 	}
-	return nil, fuse.ENOENT
+	return nil, &fs.PathError{Op: "open", Err: fs.ErrNotExist, Path: name}
 }
 
 // roFile is a read-only file, or symlink.
 type roFile struct {
-	fs        *CamliFileSystem
+	fs        *PkFileSystem
 	permanode blob.Ref
 	parent    *roDir
 	name      string // ent name (base name within parent)
 
-	mu           sync.Mutex // protects all following fields
-	symLink      bool       // if true, is a symlink
-	target       string     // if a symlink
-	content      blob.Ref   // if a regular file
-	size         int64
-	mtime, atime time.Time // if zero, use serverStart
-	xattrs       map[string][]byte
+	mu      sync.Mutex // protects all following fields
+	reader  *schema.FileReader
+	symLink bool     // if true, is a symlink
+	target  string   // if a symlink
+	content blob.Ref // if a regular file
+	size    int64
+	mtime   time.Time // if zero, use serverStart
+	// atime time.Time
+	// xattrs       map[string][]byte
 }
 
-var _ fs.Node = (*roFile)(nil)
-var _ fs.NodeGetxattrer = (*roFile)(nil)
-var _ fs.NodeListxattrer = (*roFile)(nil)
-var _ fs.NodeSetxattrer = (*roFile)(nil)
-var _ fs.NodeRemovexattrer = (*roFile)(nil)
-var _ fs.NodeOpener = (*roFile)(nil)
-var _ fs.NodeFsyncer = (*roFile)(nil)
-var _ fs.NodeReadlinker = (*roFile)(nil)
+var _ fs.File = (*roFile)(nil)
 
-func (n *roDir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, res *fuse.GetxattrResponse) error {
-	return n.xattr().get(req, res)
-}
-
-func (n *roDir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, res *fuse.ListxattrResponse) error {
-	return n.xattr().list(req, res)
-}
-
-func (n *roFile) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, res *fuse.GetxattrResponse) error {
-	return n.xattr().get(req, res)
-}
-
-func (n *roFile) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, res *fuse.ListxattrResponse) error {
-	return n.xattr().list(req, res)
-}
-
-func (n *roFile) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) error {
-	return fuse.EPERM
-}
-
-func (n *roFile) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) error {
-	return fuse.EPERM
-}
+func (n *roFile) Close() error { return nil }
 
 // for debugging
 func (n *roFile) fullPath() string {
@@ -275,45 +251,54 @@ func (n *roFile) fullPath() string {
 	return filepath.Join(n.parent.fullPath(), n.name)
 }
 
-func (n *roFile) Attr(ctx context.Context, a *fuse.Attr) error {
-	// TODO: don't grab n.mu three+ times in here.
+func (n *roFile) Stat() (fs.FileInfo, error) {
 	var mode os.FileMode = 0400 // read-only
 
 	n.mu.Lock()
 	size := n.size
-	var blocks uint64
-	if size > 0 {
-		blocks = uint64(size)/512 + 1
-	}
-	inode := n.permanode.Sum64()
+	// inode := n.permanode.Sum64()
 	if n.symLink {
 		mode |= os.ModeSymlink
 	}
 	n.mu.Unlock()
 
-	*a = fuse.Attr{
-		Inode:  inode,
-		Mode:   mode,
-		Uid:    uint32(os.Getuid()),
-		Gid:    uint32(os.Getgid()),
-		Size:   uint64(size),
-		Blocks: blocks,
-		Mtime:  n.modTime(),
-		Atime:  n.accessTime(),
-		Ctime:  serverStart,
-	}
-	return nil
+	return fileInfo{
+		name:    n.name,
+		mode:    mode,
+		size:    int64(size),
+		modTime: n.modTime(),
+	}, nil
 }
 
-func (n *roFile) accessTime() time.Time {
-	n.mu.Lock()
-	if !n.atime.IsZero() {
-		defer n.mu.Unlock()
-		return n.atime
-	}
-	n.mu.Unlock()
-	return n.modTime()
+func (n *roFile) Read(p []byte) (int, error) {
+	return n.reader.Read(p)
 }
+
+type fileInfo struct {
+	name    string
+	size    int64
+	mode    fs.FileMode
+	modTime time.Time
+}
+
+func (fi fileInfo) Name() string       { return fi.name }
+func (fi fileInfo) Size() int64        { return fi.size }
+func (fi fileInfo) Mode() fs.FileMode  { return fi.mode }
+func (fi fileInfo) ModTime() time.Time { return fi.modTime }
+func (fi fileInfo) IsDir() bool        { return fi.mode.IsDir() }
+func (fi fileInfo) Sys() any           { return nil }
+
+// Type returns the type bits for the entry.
+// The type bits are a subset of the usual FileMode bits, those returned by the FileMode.Type method.
+func (fi fileInfo) Type() fs.FileMode { return fi.mode.Type() }
+
+// Info returns the FileInfo for the file or subdirectory described by the entry.
+// The returned FileInfo may be from the time of the original directory read
+// or from the time of the call to Info. If the file has been removed or renamed
+// since the directory read, Info may return an error satisfying errors.Is(err, ErrNotExist).
+// If the entry denotes a symbolic link, Info reports the information about the link itself,
+// not the link's target.
+func (fi fileInfo) Info() (fs.FileInfo, error) { return fi, nil }
 
 func (n *roFile) modTime() time.Time {
 	n.mu.Lock()
@@ -323,79 +308,23 @@ func (n *roFile) modTime() time.Time {
 	}
 	return serverStart
 }
+func (n *roFile) Ref() blob.Ref { return n.permanode }
 
-// Empirically:
-//
-//	open for read:   req.Flags == 0
-//	open for append: req.Flags == 1
-//	open for write:  req.Flags == 1
-//	open for read/write (+<)   == 2 (bitmask? of?)
-//
-// open flags are O_WRONLY (1), O_RDONLY (0), or O_RDWR (2). and also
-// bitmaks of O_SYMLINK (0x200000) maybe. (from
-// fuse_filehandle_xlate_to_oflags in macosx/kext/fuse_file.h)
-func (n *roFile) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fs.Handle, error) {
-	roFileOpen.Incr()
-
-	if isWriteFlags(req.Flags) {
-		return nil, fuse.EPERM
-	}
-
-	Logger.Printf("roFile.Open: %v: content: %v dir=%v flags=%v", n.permanode, n.content, req.Dir, req.Flags)
-	r, err := schema.NewFileReader(ctx, n.fs.fetcher, n.content)
-	if err != nil {
-		roFileOpenError.Incr()
-		Logger.Printf("roFile.Open: %v", err)
-		return nil, handleEIOorEINTR(err)
-	}
-
-	// Turn off the OpenDirectIO bit (on by default in rsc fuse server.go),
-	// else append operations don't work for some reason.
-	res.Flags &= ^fuse.OpenDirectIO
-
-	// Read-only.
-	nod := &node{
-		fs:      n.fs,
-		blobref: n.content,
-	}
-	return &nodeReader{n: nod, fr: r}, nil
-}
-
-func (n *roFile) Fsync(ctx context.Context, r *fuse.FsyncRequest) error {
-	// noop
-	return nil
-}
-
-func (n *roFile) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string, error) {
-	Logger.Printf("roFile.Readlink(%q)", n.fullPath())
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if !n.symLink {
-		Logger.Printf("roFile.Readlink on node that's not a symlink?")
-		return "", fuse.EIO
-	}
-	return n.target, nil
-}
-
-// roFileOrDir is a *roFile or *roDir
 type roFileOrDir interface {
-	fs.Node
-	permanodeString() string
-	xattr() *xattr
+	fs.File
+	Ref() blob.Ref
 }
 
-func (n *roFile) permanodeString() string {
-	return n.permanode.String()
-}
-
-func (n *roDir) permanodeString() string {
-	return n.permanode.String()
-}
-
-func (n *roFile) xattr() *xattr {
-	return &xattr{"roFile", n.fs, n.permanode, &n.mu, &n.xattrs}
-}
-
-func (n *roDir) xattr() *xattr {
-	return &xattr{"roDir", n.fs, n.permanode, &n.mu, &n.xattrs}
+func isDir(d *search.DescribedPermanode) bool {
+	// Explicit
+	if d.Attr.Get("camliNodeType") == "directory" {
+		return true
+	}
+	// Implied
+	for k := range d.Attr {
+		if strings.HasPrefix(k, "camliPath:") {
+			return true
+		}
+	}
+	return false
 }

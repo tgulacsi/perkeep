@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
 Copyright 2011 The Perkeep Authors
 
@@ -14,14 +16,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package fs implements a std lib fs.FS filesystem for Perkeep.
-package fs // import "perkeep.org/pkg/fs"
+// Package fs implements a FUSE filesystem for Perkeep and is
+// used by the pk-mount binary.
+package fuse // import "perkeep.org/pkg/fs/fuse"
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"sync"
@@ -31,6 +33,9 @@ import (
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/client"
 	"perkeep.org/pkg/schema"
+
+	"bazil.org/fuse"
+	fusefs "bazil.org/fuse/fs"
 )
 
 var (
@@ -40,12 +45,10 @@ var (
 	Logger = log.New(os.Stderr, "PerkeepFS: ", log.LstdFlags)
 )
 
-type PkFileSystem struct {
+type CamliFileSystem struct {
 	fetcher blob.Fetcher
 	client  *client.Client // or nil, if not doing search queries
-	root    fs.FS
-	ctx     context.Context
-	cancel  context.CancelFunc
+	root    fusefs.Node
 
 	// IgnoreOwners, if true, collapses all file ownership to the
 	// uid/gid running the fuse filesystem, and sets all the
@@ -57,33 +60,33 @@ type PkFileSystem struct {
 	nameToAttr   *lru.Cache // ~map[string]*fuse.Attr
 }
 
-func newPkFileSystem(fetcher blob.Fetcher) *PkFileSystem {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &PkFileSystem{
+var _ fusefs.FS = (*CamliFileSystem)(nil)
+
+func newCamliFileSystem(fetcher blob.Fetcher) *CamliFileSystem {
+	return &CamliFileSystem{
 		fetcher:      fetcher,
 		blobToSchema: lru.New(1024), // arbitrary; TODO: tunable/smarter?
 		nameToBlob:   lru.New(1024), // arbitrary: TODO: tunable/smarter?
 		nameToAttr:   lru.New(1024), // arbitrary: TODO: tunable/smarter?
-		ctx:          ctx, cancel: cancel,
 	}
 }
 
-// NewDefaultPkFileSystem returns a filesystem with a generic base, from which
+// NewDefaultCamliFileSystem returns a filesystem with a generic base, from which
 // users can navigate by blobref, tag, date, etc.
-func NewDefaultPkFileSystem(client *client.Client, fetcher blob.Fetcher) *PkFileSystem {
+func NewDefaultCamliFileSystem(client *client.Client, fetcher blob.Fetcher) *CamliFileSystem {
 	if client == nil || fetcher == nil {
 		panic("nil argument")
 	}
-	fs := newPkFileSystem(fetcher)
+	fs := newCamliFileSystem(fetcher)
 	fs.root = &root{fs: fs} // root.go
 	fs.client = client
 	return fs
 }
 
-// NewRootedPkFileSystem returns a PkFileSystem with a node based on a blobref
+// NewRootedCamliFileSystem returns a CamliFileSystem with a node based on a blobref
 // as its base.
-func NewRootedPkFileSystem(cli *client.Client, fetcher blob.Fetcher, root blob.Ref) (*PkFileSystem, error) {
-	fs := newPkFileSystem(fetcher)
+func NewRootedCamliFileSystem(cli *client.Client, fetcher blob.Fetcher, root blob.Ref) (*CamliFileSystem, error) {
+	fs := newCamliFileSystem(fetcher)
 	fs.client = cli
 
 	n, err := fs.newNodeFromBlobRef(root)
@@ -97,41 +100,32 @@ func NewRootedPkFileSystem(cli *client.Client, fetcher blob.Fetcher, root blob.R
 	return fs, nil
 }
 
-func (fs *PkFileSystem) Context() context.Context { return fs.ctx }
-func (fs *PkFileSystem) Close() error             { fs.cancel(); return nil }
-
-// node implements fuse.Node with a read-only Pk "file" or
+// node implements fuse.Node with a read-only Camli "file" or
 // "directory" blob.
 type node struct {
-	fs      *PkFileSystem
+	fs      *CamliFileSystem
 	blobref blob.Ref
 
 	pnodeModTime time.Time // optionally set by recent.go; modtime of permanode
 
 	dmu     sync.Mutex    // guards dirents. acquire before mu.
-	dirents []fs.FileInfo // nil until populated once
+	dirents []fuse.Dirent // nil until populated once
 
 	mu      sync.Mutex // guards rest
-	attr    fileInfo
+	attr    fuse.Attr
 	meta    *schema.Blob
 	lookMap map[string]blob.Ref
 }
 
-func (n *node) Stat() (fs.FileInfo, error) {
+var _ fusefs.Node = (*node)(nil)
+
+func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 	if _, err := n.schema(ctx); err != nil {
 		return handleEIOorEINTR(err)
 	}
 	*a = n.attr
 	return nil
 }
-func (n *node) Close() error { return nil }
-
-type nodeReader struct {
-	*node
-	fr *schema.FileReader
-}
-
-func (nr *nodeReader) Read(p []byte) (int, error) { return nr.fr.Read(p) }
 
 func (n *node) addLookupEntry(name string, ref blob.Ref) {
 	n.mu.Lock()
@@ -142,7 +136,9 @@ func (n *node) addLookupEntry(name string, ref blob.Ref) {
 	n.lookMap[name] = ref
 }
 
-func (n *node) Open(name string) (fs.File, error) {
+var _ fusefs.NodeStringLookuper = (*node)(nil)
+
+func (n *node) Lookup(ctx context.Context, name string) (fusefs.Node, error) {
 	if name == ".quitquitquit" {
 		// TODO: only in dev mode
 		log.Fatalf("Shutting down due to .quitquitquit lookup.")
@@ -180,9 +176,105 @@ func (n *node) schema(ctx context.Context) (*schema.Blob, error) {
 	return blob, err
 }
 
-func (nr *nodeReader) Close() error {
+func isWriteFlags(flags fuse.OpenFlags) bool {
+	// TODO read/writeness are not flags, use O_ACCMODE
+	return flags&fuse.OpenFlags(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE) != 0
+}
+
+var _ fusefs.NodeOpener = (*node)(nil)
+
+func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, res *fuse.OpenResponse) (fusefs.Handle, error) {
+	Logger.Printf("CAMLI Open on %v: %#v", n.blobref, req)
+	if isWriteFlags(req.Flags) {
+		return nil, fuse.EPERM
+	}
+	ss, err := n.schema(ctx)
+	if err != nil {
+		Logger.Printf("open of %v: %v", n.blobref, err)
+		return nil, handleEIOorEINTR(err)
+	}
+	if ss.Type() == schema.TypeDirectory {
+		return n, nil
+	}
+	fr, err := ss.NewFileReader(n.fs.fetcher)
+	if err != nil {
+		// Will only happen if ss.Type != "file" or "bytes"
+		Logger.Printf("NewFileReader(%s) = %v", n.blobref, err)
+		return nil, fuse.EIO
+	}
+	return &nodeReader{n: n, fr: fr}, nil
+}
+
+type nodeReader struct {
+	n  *node
+	fr *schema.FileReader
+}
+
+var _ fusefs.HandleReader = (*nodeReader)(nil)
+
+func (nr *nodeReader) Read(ctx context.Context, req *fuse.ReadRequest, res *fuse.ReadResponse) error {
+	Logger.Printf("CAMLI nodeReader READ on %v: %#v", nr.n.blobref, req)
+	if req.Offset >= nr.fr.Size() {
+		return nil
+	}
+	size := req.Size
+	if int64(size)+req.Offset >= nr.fr.Size() {
+		size -= int((int64(size) + req.Offset) - nr.fr.Size())
+	}
+	buf := make([]byte, size)
+	n, err := nr.fr.ReadAt(buf, req.Offset)
+	if err == io.EOF {
+		err = nil
+	}
+	if err != nil {
+		Logger.Printf("camli read on %v at %d: %v", nr.n.blobref, req.Offset, err)
+		return fuse.EIO
+	}
+	res.Data = buf[:n]
+	return nil
+}
+
+var _ fusefs.HandleReleaser = (*nodeReader)(nil)
+
+func (nr *nodeReader) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	Logger.Printf("CAMLI nodeReader RELEASE on %v", nr.n.blobref)
-	return nr.fr.Close()
+	nr.fr.Close()
+	return nil
+}
+
+var _ fusefs.HandleReadDirAller = (*node)(nil)
+
+func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	Logger.Printf("CAMLI ReadDirAll on %v", n.blobref)
+	n.dmu.Lock()
+	defer n.dmu.Unlock()
+	if n.dirents != nil {
+		return n.dirents, nil
+	}
+
+	ss, err := n.schema(ctx)
+	if err != nil {
+		Logger.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
+		return nil, handleEIOorEINTR(err)
+	}
+	dr, err := schema.NewDirReader(ctx, n.fs.fetcher, ss.BlobRef())
+	if err != nil {
+		Logger.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
+		return nil, handleEIOorEINTR(err)
+	}
+	schemaEnts, err := dr.Readdir(ctx, -1)
+	if err != nil {
+		Logger.Printf("camli.ReadDirAll error on %v: %v", n.blobref, err)
+		return nil, handleEIOorEINTR(err)
+	}
+	n.dirents = make([]fuse.Dirent, 0)
+	for _, sent := range schemaEnts {
+		if name := sent.FileName(); name != "" {
+			n.addLookupEntry(name, sent.BlobRef())
+			n.dirents = append(n.dirents, fuse.Dirent{Name: name})
+		}
+	}
+	return n.dirents, nil
 }
 
 // populateAttr should only be called once n.ss is known to be set and
@@ -190,7 +282,7 @@ func (nr *nodeReader) Close() error {
 func (n *node) populateAttr() error {
 	meta := n.meta
 
-	n.attr.mode = meta.FileMode()
+	n.attr.Mode = meta.FileMode()
 
 	if n.fs.IgnoreOwners {
 		n.attr.Uid = uint32(os.Getuid())
@@ -225,11 +317,29 @@ func (n *node) populateAttr() error {
 	return nil
 }
 
+func (fs *CamliFileSystem) Root() (fusefs.Node, error) {
+	return fs.root, nil
+}
+
+var _ fusefs.FSStatfser = (*CamliFileSystem)(nil)
+
+func (fs *CamliFileSystem) Statfs(ctx context.Context, req *fuse.StatfsRequest, res *fuse.StatfsResponse) error {
+	// Make some stuff up, just to see if it makes "lsof" happy.
+	res.Blocks = 1 << 35
+	res.Bfree = 1 << 34
+	res.Bavail = 1 << 34
+	res.Files = 1 << 29
+	res.Ffree = 1 << 28
+	res.Namelen = 2048
+	res.Bsize = 1024
+	return nil
+}
+
 // Errors returned are:
 //
 //	os.ErrNotExist -- blob not found
 //	os.ErrInvalid -- not JSON or a camli schema blob
-func (fs *PkFileSystem) fetchSchemaMeta(ctx context.Context, br blob.Ref) (*schema.Blob, error) {
+func (fs *CamliFileSystem) fetchSchemaMeta(ctx context.Context, br blob.Ref) (*schema.Blob, error) {
 	blobStr := br.String()
 	if blob, ok := fs.blobToSchema.Get(blobStr); ok {
 		return blob.(*schema.Blob), nil
@@ -254,7 +364,7 @@ func (fs *PkFileSystem) fetchSchemaMeta(ctx context.Context, br blob.Ref) (*sche
 }
 
 // consolated logic for determining a node to mount based on an arbitrary blobref
-func (fs *PkFileSystem) newNodeFromBlobRef(root blob.Ref) (fs.File, error) {
+func (fs *CamliFileSystem) newNodeFromBlobRef(root blob.Ref) (fusefs.Node, error) {
 	blob, err := fs.fetchSchemaMeta(context.TODO(), root)
 	if err != nil {
 		return nil, err
