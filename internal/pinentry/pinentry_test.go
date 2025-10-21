@@ -1,7 +1,5 @@
-//go:build linux || darwin || freebsd
-
 /*
-Copyright 2013 The Perkeep Authors
+Copyright 2025 The Perkeep Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,24 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package osutil
+package pinentry
 
 import (
-	"runtime"
-	"syscall"
+	"flag"
+	"testing"
 )
 
-func init() {
-	memUsage = memUnix
-}
+var manual = flag.Bool("manual", false, "set to true to run the pinentry test (it requires user interaction)")
 
-func memUnix() int64 {
-	var ru syscall.Rusage
-	syscall.Getrusage(0, &ru) // nolint:errcheck
-	if runtime.GOOS == "linux" {
-		// in KB
-		return int64(ru.Maxrss) << 10
+func TestPinEntry(t *testing.T) {
+	if !*manual {
+		t.Skip("Skipping pinentry test; use -manual to run it")
 	}
-	// In bytes:
-	return int64(ru.Maxrss)
+
+	req := &Request{
+		Desc:   "Oh hi",
+		Prompt: "a prompt",
+		OK:     "Ja",
+		Cancel: "Nein",
+		Error:  "Fehler",
+	}
+	pin, err := req.GetPIN()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Got pin: %q", pin)
 }
