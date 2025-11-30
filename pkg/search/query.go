@@ -252,10 +252,10 @@ func (q *SearchQuery) checkValid(ctx context.Context) (sq *SearchQuery, err erro
 	expr := q.Expression
 	sq, err = parseExpression(ctx, expr)
 	if err != nil {
-		return nil, fmt.Errorf("Error parsing search expression %q: %v", expr, err)
+		return nil, fmt.Errorf("Error parsing search expression %q: %w", expr, err)
 	}
 	if err := sq.Constraint.checkValid(); err != nil {
-		return nil, fmt.Errorf("Internal error: parseExpression(%q) returned invalid constraint: %v", expr, err)
+		return nil, fmt.Errorf("Internal error: parseExpression(%q) returned invalid constraint: %w", expr, err)
 	}
 	return sq, nil
 }
@@ -990,7 +990,7 @@ func (h *Handler) Query(ctx context.Context, rawq *SearchQuery) (ret_ *SearchRes
 	}
 	exprResult, err := rawq.checkValid(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("Invalid SearchQuery: %v", err)
+		return nil, fmt.Errorf("Invalid SearchQuery: %w", err)
 	}
 	q := rawq.plannedQuery(exprResult)
 	res := new(SearchResult)
@@ -1059,10 +1059,7 @@ func (h *Handler) Query(ctx context.Context, rawq *SearchQuery) (ret_ *SearchRes
 					// If Limit is even, and the number of results before and after Around
 					// are both greater than half the limit, then there will be one more result before
 					// than after.
-					discard := len(res.Blobs) - q.Limit/2 - 1
-					if discard < 0 {
-						discard = 0
-					}
+					discard := max(len(res.Blobs)-q.Limit/2-1, 0)
 					res.Blobs = res.Blobs[discard:]
 				}
 				if len(res.Blobs) == q.Limit {
@@ -1140,14 +1137,8 @@ func (h *Handler) Query(ctx context.Context, rawq *SearchQuery) (ret_ *SearchRes
 					if aroundPos == len(res.Blobs) || res.Blobs[aroundPos].Blob != q.Around {
 						panic("q.Around blobRef should be in the results")
 					}
-					lowerBound := aroundPos - q.Limit/2
-					if lowerBound < 0 {
-						lowerBound = 0
-					}
-					upperBound := lowerBound + q.Limit
-					if upperBound > len(res.Blobs) {
-						upperBound = len(res.Blobs)
-					}
+					lowerBound := max(aroundPos-q.Limit/2, 0)
+					upperBound := min(lowerBound+q.Limit, len(res.Blobs))
 					res.Blobs = res.Blobs[lowerBound:upperBound]
 				} else {
 					res.Blobs = res.Blobs[:q.Limit]
@@ -1761,7 +1752,7 @@ func (c *PermanodeConstraint) blobMatches(ctx context.Context, s *search, br blo
 		l, err := s.h.lh.PermanodeLocation(ctx, br, c.At, s.h.owner)
 		if c.Location != nil {
 			if err != nil {
-				if err != os.ErrNotExist {
+				if !errors.Is(err, os.ErrNotExist) {
 					log.Printf("PermanodeLocation(ref %s): %v", br, err)
 				}
 				return false, nil
@@ -1865,7 +1856,7 @@ func (c *PermanodeConstraint) permanodeMatchesAttrVal(ctx context.Context, s *se
 			return false, nil
 		}
 		meta, err := s.blobMeta(ctx, br)
-		if err == os.ErrNotExist {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 		if err != nil {
@@ -1885,7 +1876,7 @@ func (c *FileConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref
 		return false, nil
 	}
 	fi, err := s.fileInfo(ctx, br)
-	if err == os.ErrNotExist {
+	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
@@ -1915,7 +1906,7 @@ func (c *FileConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref
 	}
 	if pc := c.ParentDir; pc != nil {
 		parents, err := s.parentDirs(ctx, br)
-		if err == os.ErrNotExist {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 		if err != nil {
@@ -2097,7 +2088,7 @@ func (c *DirConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref,
 		}
 	}
 	fi, err := s.fileInfo(ctx, br)
-	if err == os.ErrNotExist {
+	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
@@ -2108,7 +2099,7 @@ func (c *DirConstraint) blobMatches(ctx context.Context, s *search, br blob.Ref,
 	}
 	if pc := c.ParentDir; pc != nil {
 		parents, err := s.parentDirs(ctx, br)
-		if err == os.ErrNotExist {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 		if err != nil {

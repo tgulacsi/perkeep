@@ -232,7 +232,7 @@ func NewHost(hc HostConfig) (*Host, error) {
 	if err != nil {
 		return nil, err
 	}
-	h.tmpl = h.tmpl.Funcs(map[string]interface{}{
+	h.tmpl = h.tmpl.Funcs(map[string]any{
 		"bloblink": func(br blob.Ref) template.HTML {
 			if h.uiPrefix == "" {
 				return template.HTML(br.String())
@@ -289,7 +289,7 @@ func newFromConfig(ld blobserver.Loader, cfg jsonconfig.Obj) (http.Handler, erro
 				}
 			}
 			if err := impConf.Validate(); err != nil {
-				return nil, fmt.Errorf("Invalid static configuration for importer %q: %v", k, err)
+				return nil, fmt.Errorf("Invalid static configuration for importer %q: %w", k, err)
 			}
 			ClientId[k] = clientId
 			ClientSecret[k] = clientSecret
@@ -371,7 +371,7 @@ func CreateAccount(h *Host, impl string) (*RunContext, error) {
 	}
 	ia, err := imp.newAccount()
 	if err != nil {
-		return nil, fmt.Errorf("could not create new account for importer %v: %v", impl, err)
+		return nil, fmt.Errorf("could not create new account for importer %v: %w", impl, err)
 	}
 	rc := &RunContext{
 		Host: ia.im.host,
@@ -449,7 +449,7 @@ type accountStatus struct {
 
 // AccountsStatus returns the currently configured accounts and their status for
 // inclusion in the status.json document, as rendered by the web UI.
-func (h *Host) AccountsStatus() (interface{}, []camtypes.StatusError) {
+func (h *Host) AccountsStatus() (any, []camtypes.StatusError) {
 	h.didInit.Wait()
 	var s []accountStatus
 	var errs []camtypes.StatusError
@@ -1265,7 +1265,10 @@ func (ia *importerAcct) serveHTTPPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "togglepaidapi":
+		ia.mu.Lock()
 		ia.usePaidAPI = r.FormValue("usePaidAPI") == "on"
+		// TODO(bradfitz,radkat): persist this to the account permanode
+		ia.mu.Unlock()
 	case "delete":
 		ia.stop() // can't hurt
 		if err := ia.delete(); err != nil {
