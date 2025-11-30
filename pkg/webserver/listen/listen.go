@@ -78,13 +78,16 @@ func (a *Addr) String() string {
 func (a *Addr) Set(v string) error {
 	a.s = v
 
-	if strings.HasPrefix(v, "FD:") {
-		fdStr := v[len("FD:"):]
+	if fdStr, ok := strings.CutPrefix(v, "FD:"); ok {
 		fd, err := strconv.ParseUint(fdStr, 10, 32)
 		if err != nil {
 			return fmt.Errorf("invalid file descriptor %q: %w", fdStr, err)
 		}
 		return a.listenOnFD(uintptr(fd))
+	} else if unixStr, ok := strings.CutPrefix(v, "unix:"); ok {
+		var err error
+		a.ln, err = net.Listen("unix", unixStr)
+		return err
 	}
 
 	ipPort := v
