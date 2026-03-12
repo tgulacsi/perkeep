@@ -19,15 +19,18 @@ limitations under the License.
 package httputil // import "perkeep.org/internal/httputil"
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"io"
 	"net/url"
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/go-json-experiment/json"
+	"github.com/go-json-experiment/json/jsontext"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/env"
@@ -74,7 +77,7 @@ func ReturnJSON(rw http.ResponseWriter, data any) {
 }
 
 func ReturnJSONCode(rw http.ResponseWriter, code int, data any) {
-	js, err := json.MarshalIndent(data, "", "  ")
+	js, err := json.Marshal(data, jsontext.WithIndent("  "))
 	if err != nil {
 		BadRequestError(rw, "JSON serialization error: %v", err)
 		return
@@ -272,8 +275,9 @@ func ServeJSONError(rw http.ResponseWriter, err any) {
 // res.Body.
 func DecodeJSON(res *http.Response, dest any) error {
 	defer res.Body.Close()
-	if err := json.NewDecoder(res.Body).Decode(dest); err != nil {
-		return fmt.Errorf("httputil.DecodeJSON: %w", err)
+	var buf strings.Builder
+	if err := json.UnmarshalRead(io.TeeReader(res.Body, &buf), dest); err != nil {
+		return fmt.Errorf("httputil.DecodeJSON %s: %w", buf.String(), err)
 	}
 	return nil
 }
