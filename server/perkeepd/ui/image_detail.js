@@ -30,7 +30,9 @@ cam.ImageDetail = React.createClass({
 	propTypes: {
 		backwardPiggy: React.PropTypes.bool.isRequired,
 		height: React.PropTypes.number.isRequired,
+		nextMeta: React.PropTypes.object,
 		permanodeMeta: React.PropTypes.object,
+		prevMeta: React.PropTypes.object,
 		resolvedMeta: React.PropTypes.object.isRequired,
 		width: React.PropTypes.number.isRequired,
 	},
@@ -58,8 +60,29 @@ cam.ImageDetail = React.createClass({
 		this.imgSize_ = this.getImgSize_();
 		return React.DOM.div({className:'detail-view', style: this.getStyle_()},
 			this.getImg_(),
-			this.getPiggy_()
+			this.getPiggy_(),
+			this.getPreloadImages_()
 		);
+	},
+
+	getPreloadImages_: function() {
+		var preloads = [];
+		var height = this.imgSize_ ? this.imgSize_.height : 1000;
+
+		[this.props.prevMeta, this.props.nextMeta].forEach(function(meta, i) {
+			if (meta && meta.image) {
+				var thumber = cam.Thumber.fromImageMeta(meta);
+				if (thumber) {
+					preloads.push(React.DOM.link({
+						key: 'preload-' + i,
+						rel: 'preload',
+						as: 'image',
+						href: thumber.getSrc(height)
+					}));
+				}
+			}
+		});
+		return preloads;
 	},
 
 	getSinglePermanodeAttr_: function(name) {
@@ -163,6 +186,20 @@ cam.ImageDetail.getAspect = function(blobref, searchSession) {
 
 	// We don't handle camliContentImage like BlobItemImage.getHandler does because that only tells us what image to display in the search results. It doesn't actually make the permanode an image or anything.
 	if (rm && (rm.image || cam.BlobItemVideoContent.isVideo(rm))) {
+		// Find adjacent blobrefs for preloading
+		var prevMeta = null;
+		var nextMeta = null;
+		var blobs = searchSession.getCurrentResults().blobs;
+		var idx = goog.array.findIndex(blobs, function(item) {
+			return item.blob == blobref;
+		});
+		if (idx > 0) {
+			prevMeta = searchSession.getResolvedMeta(blobs[idx - 1].blob);
+		}
+		if (idx >= 0 && idx < blobs.length - 1) {
+			nextMeta = searchSession.getResolvedMeta(blobs[idx + 1].blob);
+		}
+
 		return {
 			fragment: 'image',
 			title: 'Image',
@@ -171,7 +208,9 @@ cam.ImageDetail.getAspect = function(blobref, searchSession) {
 					backwardPiggy: backwardPiggy,
 					key: 'image',
 					height: size.height,
+					nextMeta: nextMeta,
 					permanodeMeta: pm,
+					prevMeta: prevMeta,
 					resolvedMeta: rm,
 					width: size.width,
 				});

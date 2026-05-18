@@ -644,12 +644,11 @@ cam.IndexPage = React.createClass({
 	updateTargetSearchSession_: function(targetBlobref, newURL) {
 		this.targetSearchSession_ = null;
 		if (targetBlobref) {
-			var opt_sort = "blobref";
-			var query = this.queryAsBlob_(targetBlobref);
+			var opt_sort = "-created";
+			var query = '';  // default to all blobs for swipe navigation
 			var parentPermanode = newURL.getParameterValue('p');
 			if (parentPermanode) {
 				query = this.queryFromParentPermanode_(parentPermanode);
-				opt_sort = "-created";
 			} else {
 				var queryString = newURL.getParameterValue('q');
 				if (queryString) {
@@ -1148,10 +1147,10 @@ cam.IndexPage = React.createClass({
 			return;
 		}
 		var touches = e.getBrowserEvent().changedTouches;
-		var halfScreen = this.props.availWidth / 2;
+		var swipeThreshold = this.props.availWidth / 10;
 		for (var i = 0; i < touches.length; i++) {
 			var swipeLength = touches[i].pageX - this.state.touchStartPosition;
-			if (Math.abs(swipeLength) < halfScreen) {
+			if (Math.abs(swipeLength) < swipeThreshold) {
 				// do nothing if half-hearted swipe
 				this.setState({touchStartPosition: -1});
 				return;

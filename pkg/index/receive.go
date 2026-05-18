@@ -48,6 +48,7 @@ import (
 	"perkeep.org/pkg/blobserver"
 	"perkeep.org/pkg/jsonsign"
 	"perkeep.org/pkg/schema"
+	"tailscale.com/util/mak"
 )
 
 func init() {
@@ -140,7 +141,14 @@ func (ix *Index) indexReadyBlobs(ctx context.Context) {
 	}
 
 	failed := make(map[blob.Ref]bool)
-	for br, ok := popReadyReindex(); ok; br, ok = popReadyReindex() {
+	for {
+		br, ok := popReadyReindex()
+		if !ok {
+			break
+		}
+		if verboseReindex {
+			log.Printf("reindex: reindexing blob %v now that its dependencies are satisfied", br)
+		}
 		if err := ix.indexBlob(ctx, br); err != nil {
 			log.Printf("out-of-order indexBlob(%v) = %v", br, err)
 			failed[br] = true
@@ -157,7 +165,9 @@ func (ix *Index) indexReadyBlobs(ctx context.Context) {
 // noteBlobIndexed checks if the recent indexing of br now allows the blobs that
 // were depending on br, to be indexed in turn. If yes, they're reindexed
 // asynchronously by indexReadyBlobs.
-func (ix *Index) noteBlobIndexed(br blob.Ref) {
+//
+// ix.mu must be held.
+func (ix *Index) noteBlobIndexedLocked(br blob.Ref) {
 	for _, needer := range ix.neededBy[br] {
 		newNeeds := blobsFilteringOut(ix.needs[needer], br)
 		if len(newNeeds) == 0 {
@@ -170,6 +180,8 @@ func (ix *Index) noteBlobIndexed(br blob.Ref) {
 		}
 	}
 	delete(ix.neededBy, br)
+
+	mak.Set(&ix.recentDone, br, true)
 }
 
 func (ix *Index) removeAllMissingEdges(br blob.Ref) {
@@ -190,6 +202,12 @@ func (ix *Index) removeAllMissingEdges(br blob.Ref) {
 }
 
 func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Reader) (blob.SizedRef, error) {
+	pendVal, err := ix.getNewPendingBlobIndex(ctx, blobRef)
+	if err != nil {
+		return blob.SizedRef{}, err
+	}
+	defer func() { pendVal.MarkDone() }()
+
 	// Read from source before acquiring ix.Lock (Issue 878):
 	sniffer := NewBlobSniffer(blobRef)
 	written, err := io.Copy(sniffer, source)
@@ -197,19 +215,6 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 		return blob.SizedRef{}, err
 	}
 	sbr := blob.SizedRef{Ref: blobRef, Size: uint32(written)}
-
-	ix.Lock()
-	defer ix.Unlock()
-
-	missingDeps := false
-	defer func() {
-		if err == nil {
-			ix.noteBlobIndexed(blobRef)
-			if !missingDeps {
-				ix.removeAllMissingEdges(blobRef)
-			}
-		}
-	}()
 
 	// By default, return immediately if it looks like we already
 	// have indexed this blob before.  But if the user has
@@ -238,10 +243,16 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 		fetcher: ix.blobSource,
 	}
 
+	// Read subsidiary blobs from source before acquiring ix.Lock (also issue 878).
 	mm, err := ix.populateMutationMap(ctx, fetcher, blobRef, sniffer)
 	if debugEnv {
 		log.Printf("index of %v: mm=%v, err=%v", blobRef, mm, err)
 	}
+	// err is checked below
+
+	ix.Lock()
+	defer ix.Unlock()
+
 	if err != nil {
 		if !errors.Is(err, errMissingDep) {
 			return blob.SizedRef{}, err
@@ -251,10 +262,9 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 		if len(fetcher.missing) == 0 {
 			panic("errMissingDep happened, but no fetcher.missing recorded")
 		}
-		missingDeps = true
 		allRecorded := true
 		for _, missing := range fetcher.missing {
-			if err := ix.noteNeeded(blobRef, missing); err != nil {
+			if err := ix.noteNeededLocked(blobRef, missing); err != nil {
 				allRecorded = false
 			}
 		}
@@ -273,10 +283,16 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 	}
 
 	if c := ix.corpus; c != nil {
-		if err = c.addBlob(ctx, blobRef, mm); err != nil {
+		if err := c.addBlob(ctx, blobRef, mm); err != nil {
 			return blob.SizedRef{}, err
 		}
 	}
+
+	ix.noteBlobIndexedLocked(blobRef)
+
+	// TODO(bradfitz): this removeAllMissingEdges need not hold ix.Lock
+	// and could be done in the background.
+	ix.removeAllMissingEdges(blobRef)
 
 	// TODO(bradfitz): log levels? These are generally noisy
 	// (especially in tests, like search/handler_test), but I
@@ -321,7 +337,7 @@ func (ix *Index) verifySignature(ctx context.Context, fetcher *missTrackFetcher,
 	if err != nil {
 		// TODO(bradfitz): ask if the vr.Err.(jsonsign.Error).IsPermanent() and retry
 		// later if it's not permanent?
-		if tf.hasErrNotExist() {
+		if tf.allErrNotExist() {
 			return nil, errMissingDep
 		}
 		return nil, err
@@ -376,6 +392,9 @@ func (ix *Index) populateMutationMap(ctx context.Context, fetcher *missTrackFetc
 		haveVal = fmt.Sprintf("%d|indexed", sniffer.Size())
 	}
 	mm.kv["have:"+br.String()] = haveVal
+
+	fetcher.mu.Lock()
+	defer fetcher.mu.Unlock()
 	if len(fetcher.missing) == 0 {
 		// If err == nil, we're good. Else (err == errMissingDep), we
 		// know the error did not come from a fetching miss (because
@@ -417,6 +436,9 @@ func (f *missTrackFetcher) Fetch(ctx context.Context, br blob.Ref) (blob io.Read
 	if errors.Is(err, os.ErrNotExist) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if verboseReindex {
+			log.Printf("index: missTrackFetcher: missing blob %v", br)
+		}
 		f.missing = append(f.missing, br)
 	}
 	return
@@ -440,9 +462,9 @@ func (tf *trackErrorsFetcher) Fetch(ctx context.Context, br blob.Ref) (blob io.R
 	return
 }
 
-// hasErrNotExist reports whether tf recorded any error and if all of them are
+// allErrNotExist reports whether tf recorded any error and if all of them are
 // os.ErrNotExist errors.
-func (tf *trackErrorsFetcher) hasErrNotExist() bool {
+func (tf *trackErrorsFetcher) allErrNotExist() bool {
 	tf.mu.RLock()
 	defer tf.mu.RUnlock()
 	if len(tf.errs) == 0 {
@@ -513,7 +535,7 @@ func (ix *Index) populateFile(ctx context.Context, fetcher blob.Fetcher, b *sche
 	}
 	size, err := io.Copy(copyDest, mr)
 	if err != nil {
-		if tf.hasErrNotExist() {
+		if tf.allErrNotExist() {
 			return errMissingDep
 		}
 		return err
@@ -812,7 +834,7 @@ func (ix *Index) populateDir(ctx context.Context, fetcher blob.Fetcher, b *schem
 	}
 	sts, err := dr.StaticSet(ctx)
 	if err != nil {
-		if tf.hasErrNotExist() {
+		if tf.allErrNotExist() {
 			return errMissingDep
 		}
 		log.Printf("index: error indexing directory: can't get StaticSet: %v\n", err)
@@ -879,7 +901,7 @@ func (ix *Index) populateClaim(ctx context.Context, fetcher *missTrackFetcher, b
 	mm.signerBlobRef = vr.CamliSigner
 	mm.Set(keySignerKeyID.name+":"+vr.CamliSigner.String(), verifiedKeyId)
 
-	if claim.ClaimType() == string(schema.DeleteClaim) {
+	if claim.ClaimType() == schema.DeleteClaim {
 		if err := ix.populateDeleteClaim(ctx, claim, vr, mm); err != nil {
 			return err
 		}
@@ -925,7 +947,7 @@ func (ix *Index) populateClaim(ctx context.Context, fetcher *missTrackFetcher, b
 		}
 	}
 
-	if claim.ClaimType() != string(schema.DelAttributeClaim) && IsIndexedAttribute(attr) {
+	if claim.ClaimType() != schema.DelAttributeClaim && IsIndexedAttribute(attr) {
 		key := keySignerAttrValue.Key(verifiedKeyId, attr, value, claim.ClaimDateString(), br)
 		mm.Set(key, keySignerAttrValue.Val(pnbr))
 	}
