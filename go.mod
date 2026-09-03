@@ -12,6 +12,7 @@ require (
 	github.com/aws/aws-sdk-go v1.44.51
 	github.com/bradfitz/latlong v0.0.0-20170410180902-f3db6d0dff40
 	github.com/garyburd/go-oauth v0.0.0-20180319155456-bca2e7f09a17
+	github.com/go-chi/chi/v5 v5.3.2
 	github.com/go-sql-driver/mysql v1.9.2
 	github.com/gopherjs/gopherjs v0.0.0-20200217142428-fce0ec30dd00
 	github.com/gopherjs/jquery v0.0.0-20180404123100-3ba2b901425e
@@ -20,6 +21,7 @@ require (
 	github.com/lib/pq v1.10.9
 	github.com/mattn/go-mastodon v0.0.5-0.20190517015615-8f6192e26b66
 	github.com/nf/cr2 v0.0.0-20140528043846-05d46fef4f2f
+	github.com/oapi-codegen/runtime v1.7.0
 	github.com/perkeep/heic v0.0.0-20260105010044-a57ca1ce101f
 	github.com/pkg/sftp v1.13.9
 	github.com/plaid/plaid-go v0.0.0-20161222051224-02b6af68061b
@@ -67,6 +69,7 @@ require (
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/creachadair/msync v0.8.1 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa // indirect
+	github.com/dprotaso/go-yit v0.0.0-20220510233725-9ba8df137936 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/edsrzf/mmap-go v1.1.0 // indirect
@@ -104,6 +107,7 @@ require (
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/safchain/ethtool v0.3.0 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/shurcooL/sanitized_anchor_name v1.0.0 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d // indirect
@@ -114,6 +118,7 @@ require (
 	github.com/tailscale/wireguard-go v0.0.0-20260715223240-2e01ba5b00f0 // indirect
 	github.com/tetratelabs/wazero v1.9.0 // indirect
 	github.com/tomnomnom/linkheader v0.0.0-20180905144013-02ca5825eb80 // indirect
+	github.com/vmware-labs/yaml-jsonpath v0.3.2 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/detectors/gcp v1.38.0 // indirect
@@ -155,3 +160,5 @@ require (
 	modernc.org/token v1.0.1 // indirect
 	modernc.org/zappy v1.0.3 // indirect
 )
+
+tool github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen
