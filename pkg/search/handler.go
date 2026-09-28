@@ -147,6 +147,7 @@ func newHandlerFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handl
 
 	devBlockStartupPrefix := conf.OptionalString("devBlockStartupOn", "")
 	slurpToMemory := conf.OptionalBool("slurpToMemory", false)
+	corpusFile := conf.OptionalString("corpusFile", "")
 	if err := conf.Validate(); err != nil {
 		return nil, err
 	}
@@ -176,17 +177,20 @@ func newHandlerFromConfig(ld blobserver.Loader, conf jsonconfig.Obj) (http.Handl
 	}
 	h := NewHandler(indexer, owner)
 
-	if slurpToMemory {
-		ii := indexer.(*index.Index)
-		ii.Lock()
-		corpus, err := ii.KeepInMemory()
-		if err != nil {
+	ii := indexer.(*index.Index)
+	ii.Lock()
+	var corpus index.Corpus
+	if corpusFile == "" || slurpToMemory {
+		if corpus, err = ii.KeepInMemory(); err != nil {
 			ii.Unlock()
 			return nil, fmt.Errorf("error slurping index to memory: %w", err)
 		}
-		h.SetCorpus(corpus)
+	} else if corpus, err = ii.StoreInDB(corpusFile); err != nil {
 		ii.Unlock()
+		return nil, fmt.Errorf("error slurping index to db: %w", err)
 	}
+	h.SetCorpus(corpus)
+	ii.Unlock()
 
 	return h, nil
 }

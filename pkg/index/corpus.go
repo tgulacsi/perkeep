@@ -35,8 +35,7 @@ import (
 // Corpus is a summary of all of a user's blobs' metadata, as used by the
 // search machinery. The index package provides an in-memory implementation
 // (the unexported corpusMem type, obtained with Index.KeepInMemory or
-// NewCorpusFromStorage), and perkeep.org/pkg/index/dbcorpus provides an
-// implementation backed by a database/sql (SQLite) database.
+// NewCorpusFromStorage).
 //
 // A Corpus is not safe for concurrent use. Callers should use Lock or RLock
 // on the parent index instead.
@@ -341,7 +340,7 @@ func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
 	return nil, false
 }
 
-func newCorpus() *corpusMem {
+func newCorpusMem() *corpusMem {
 	c := &corpusMem{
 		blobs:                   make(map[blob.Ref]*camtypes.BlobMeta),
 		camBlobs:                make(map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta),
@@ -381,7 +380,13 @@ func NewCorpusFromStorage(s sorted.KeyValue) (Corpus, error) {
 
 func (x *Index) KeepInMemory() (Corpus, error) {
 	var err error
-	x.corpus, err = NewCorpusFromStorage(x.s)
+	x.corpus, err = newMemCorpusFromStorage(x.s)
+	return x.corpus, err
+}
+
+func (x *Index) StoreInDB(file string) (Corpus, error) {
+	var err error
+	x.corpus, err = NewDBCorpusFromStorage(file, x.s)
 	return x.corpus, err
 }
 

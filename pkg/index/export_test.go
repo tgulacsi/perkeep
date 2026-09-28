@@ -34,7 +34,7 @@ func ExpUnreverseTimeString(s string) string {
 }
 
 func ExpNewCorpus() *corpusMem {
-	return newCorpus()
+	return newCorpusMem()
 }
 
 // ExpKeepInMemory is KeepInMemory with a concrete result type, for tests
