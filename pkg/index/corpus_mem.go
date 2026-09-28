@@ -45,7 +45,7 @@ import (
 var _ Corpus = (*corpusMem)(nil)
 
 func newMemCorpusFromStorage(s sorted.KeyValue) (*corpusMem, error) {
-	c := newCorpus()
+	c := newCorpusMem()
 	return c, c.scanFromStorage(s)
 }
 

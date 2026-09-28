@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -32,81 +33,6 @@ const (
 	keySignerKeyIDName = "signerkeyid"
 	metaGeneration     = "generation"
 )
-
-var sqlCreateTables = []string{
-	`CREATE TABLE IF NOT EXISTS blobs (
-		ref       TEXT PRIMARY KEY,
-		size      INTEGER NOT NULL,
-		camlitype TEXT NOT NULL DEFAULT ''
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS signers (
-		signerref TEXT PRIMARY KEY,
-		keyid     TEXT NOT NULL
-	) STRICT`,
-	`CREATE INDEX IF NOT EXISTS signers_by_keyid ON signers(keyid)`,
-	`CREATE TABLE IF NOT EXISTS claims (
-		claimref  TEXT PRIMARY KEY,
-		permanode TEXT NOT NULL,
-		signerref TEXT NOT NULL,
-		date      INTEGER NOT NULL, -- unix nanos
-		type      TEXT NOT NULL DEFAULT '',
-		attr      TEXT NOT NULL DEFAULT '',
-		value     TEXT NOT NULL DEFAULT ''
-	) STRICT`,
-	`CREATE INDEX IF NOT EXISTS claims_by_permanode ON claims(permanode, date)`,
-	`CREATE INDEX IF NOT EXISTS claims_by_value ON claims(value)`,
-	`CREATE TABLE IF NOT EXISTS files (
-		fileref  TEXT PRIMARY KEY,
-		size     INTEGER NOT NULL DEFAULT 0,
-		filename TEXT NOT NULL DEFAULT '',
-		mimetype TEXT NOT NULL DEFAULT '',
-		wholeref TEXT NOT NULL DEFAULT '',
-		time     INTEGER, -- unix nanos, NULL if unknown
-		modtime  INTEGER  -- unix nanos, NULL if unknown
-	) STRICT`,
-	`CREATE INDEX IF NOT EXISTS files_by_wholeref ON files(wholeref)`,
-	`CREATE TABLE IF NOT EXISTS wholetofile (
-		fileref  TEXT PRIMARY KEY,
-		wholeref TEXT NOT NULL
-	) STRICT`,
-	`CREATE INDEX IF NOT EXISTS wholetofile_by_wholeref ON wholetofile(wholeref)`,
-	`CREATE TABLE IF NOT EXISTS imagesizes (
-		fileref TEXT PRIMARY KEY,
-		width   INTEGER NOT NULL,
-		height  INTEGER NOT NULL
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS mediatags (
-		wholeref TEXT NOT NULL,
-		tag      TEXT NOT NULL,
-		value    TEXT NOT NULL DEFAULT '',
-		PRIMARY KEY (wholeref, tag)
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS exifgps (
-		wholeref TEXT PRIMARY KEY,
-		lat      REAL NOT NULL,
-		long     REAL NOT NULL
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS dirchildren (
-		parent TEXT NOT NULL,
-		child  TEXT NOT NULL,
-		PRIMARY KEY (parent, child)
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS fileparents (
-		child  TEXT NOT NULL,
-		parent TEXT NOT NULL,
-		PRIMARY KEY (child, parent)
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS deletes (
-		deleted TEXT NOT NULL,
-		deleter TEXT NOT NULL,
-		deltime INTEGER NOT NULL, -- unix nanos
-		PRIMARY KEY (deleted, deleter)
-	) STRICT`,
-	`CREATE TABLE IF NOT EXISTS meta (
-		metakey TEXT PRIMARY KEY,
-		value   TEXT NOT NULL
-	) STRICT`,
-}
 
 // dbtx is the subset of database/sql used by the merge functions, and is
 // implemented by both *sql.DB and *sql.Tx.
@@ -124,17 +50,100 @@ func openDB(file string) (*sql.DB, error) {
 	}
 	for _, s := range []string{
 		"journal_mode = WAL",
-		"cache_size = -2000",
+		"cache_size = -20000",
+		"optimize",
 	} {
 		if _, err := db.Exec("PRAGMA " + s); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("PRAGMA %s: %w", s, err)
 		}
 	}
-	for _, stmt := range sqlCreateTables {
-		if _, err := db.Exec(stmt); err != nil {
+
+	for _, stmt := range []string{
+		// partition blobs
+		`CREATE TABLE IF NOT EXISTS blobs_` + partPat + `(
+		ref       TEXT PRIMARY KEY,
+		size      INTEGER NOT NULL,
+		camlitype TEXT NOT NULL DEFAULT ''
+	) WITHOUT ROWID, STRICT`,
+		`CREATE TABLE IF NOT EXISTS signers (
+		signerref TEXT PRIMARY KEY,
+		keyid     TEXT NOT NULL
+	) WITHOUT ROWID, STRICT`,
+		`CREATE INDEX IF NOT EXISTS signers_by_keyid ON signers(keyid)`,
+		`CREATE TABLE IF NOT EXISTS claims (
+		claimref  TEXT PRIMARY KEY,
+		permanode TEXT NOT NULL,
+		signerref TEXT NOT NULL,
+		date      INTEGER NOT NULL, -- unix nanos
+		type      TEXT NOT NULL DEFAULT '',
+		attr      TEXT NOT NULL DEFAULT '',
+		value     TEXT NOT NULL DEFAULT ''
+	) WITHOUT ROWID, STRICT`,
+		`CREATE INDEX IF NOT EXISTS claims_by_permanode ON claims(permanode, date)`,
+		`CREATE INDEX IF NOT EXISTS claims_by_value ON claims(value)`,
+		`CREATE TABLE IF NOT EXISTS files (
+		fileref  TEXT PRIMARY KEY,
+		size     INTEGER NOT NULL DEFAULT 0,
+		filename TEXT NOT NULL DEFAULT '',
+		mimetype TEXT NOT NULL DEFAULT '',
+		wholeref TEXT NOT NULL DEFAULT '',
+		time     INTEGER, -- unix nanos, NULL if unknown
+		modtime  INTEGER  -- unix nanos, NULL if unknown
+	) WITHOUT ROWID, STRICT`,
+		`CREATE INDEX IF NOT EXISTS files_by_wholeref ON files(wholeref)`,
+		`CREATE TABLE IF NOT EXISTS wholetofile (
+		fileref  TEXT PRIMARY KEY,
+		wholeref TEXT NOT NULL
+	) WITHOUT ROWID, STRICT`,
+		`CREATE INDEX IF NOT EXISTS wholetofile_by_wholeref ON wholetofile(wholeref)`,
+		`CREATE TABLE IF NOT EXISTS imagesizes (
+		fileref TEXT PRIMARY KEY,
+		width   INTEGER NOT NULL,
+		height  INTEGER NOT NULL
+	) WITHOUT ROWID, STRICT`,
+		`CREATE TABLE IF NOT EXISTS mediatags (
+		wholeref TEXT NOT NULL,
+		tag      TEXT NOT NULL,
+		value    TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (wholeref, tag)
+	) STRICT`,
+		`CREATE TABLE IF NOT EXISTS exifgps (
+		wholeref TEXT PRIMARY KEY,
+		lat      REAL NOT NULL,
+		long     REAL NOT NULL
+	) WITHOUT ROWID, STRICT`,
+		`CREATE TABLE IF NOT EXISTS dirchildren (
+		parent TEXT NOT NULL,
+		child  TEXT NOT NULL,
+		PRIMARY KEY (parent, child)
+	) STRICT`,
+		`CREATE TABLE IF NOT EXISTS fileparents (
+		child  TEXT NOT NULL,
+		parent TEXT NOT NULL,
+		PRIMARY KEY (child, parent)
+	) STRICT`,
+		`CREATE TABLE IF NOT EXISTS deletes (
+		deleted TEXT NOT NULL,
+		deleter TEXT NOT NULL,
+		deltime INTEGER NOT NULL, -- unix nanos
+		PRIMARY KEY (deleted, deleter)
+	) STRICT`,
+		`CREATE TABLE IF NOT EXISTS meta (
+		metakey TEXT PRIMARY KEY,
+		value   TEXT NOT NULL
+	) STRICT`,
+	} {
+		if strings.Contains(stmt, "_"+partPat) {
+			for i := range partNum {
+				stmt := fmt.Sprintf(stmt, i)
+				if _, err := db.Exec(stmt); err != nil {
+					return nil, fmt.Errorf("dbcorpus: initializing schema: %s: %w", stmt, err)
+				}
+			}
+		} else if _, err := db.Exec(stmt); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("dbcorpus: initializing schema: %w", err)
+			return nil, fmt.Errorf("dbcorpus: initializing schema: %s: %w", stmt, err)
 		}
 	}
 	var version string
@@ -157,3 +166,8 @@ func openDB(file string) (*sql.DB, error) {
 	}
 	return db, nil
 }
+
+const (
+	partPat = "%02x"
+	partNum = 0xff // 4096
+)

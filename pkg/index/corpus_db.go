@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"go4.org/types"
+	"modernc.org/sqlite"
 
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/schema"
@@ -166,10 +167,37 @@ func (c *corpusDB) ScanFromStorage(s sorted.KeyValue) error {
 func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 	it := s.Find(prefix, prefixEnd(prefix))
 	defer closeIterator(it, &err)
+	var tx *sql.Tx
+	defer func() {
+		if tx != nil {
+			tx.Commit()
+		}
+	}()
+	start := time.Now()
+	var batchSize int
 	for it.Next() {
-		if err := c.mergeRow(c.db, []byte(it.Key()), []byte(it.Value())); err != nil {
+		if tx == nil {
+			if tx, err = c.db.Begin(); err != nil {
+				return err
+			}
+		}
+		if err := c.mergeRow(tx, []byte(it.Key()), []byte(it.Value())); err != nil {
 			return err
 		}
+		batchSize++
+		if batchSize > 32767 {
+			now := time.Now()
+			log.Printf("%d: %s", batchSize, now.Sub(start))
+			start = now
+			batchSize = 0
+			if err = tx.Commit(); err != nil {
+				return err
+			}
+			tx = nil
+		}
+	}
+	if tx != nil {
+		return tx.Commit()
 	}
 	return nil
 }
@@ -204,13 +232,18 @@ func (c *corpusDB) initDeletes(s sorted.KeyValue) (err error) {
 // index for the received blob br.
 func (c *corpusDB) AddBlob(ctx context.Context, br blob.Ref, mm *mutationMap) error {
 	var exists bool
-	if err := c.db.QueryRow(`SELECT 1 FROM blobs WHERE ref = ?`, br.String()).Scan(&exists); err == nil {
+	if err := c.db.QueryRow(
+		`SELECT 1 FROM blobs_`+refPartition(br)+` WHERE ref = ?`,
+		br.String(),
+	).Scan(&exists); err == nil {
 		// already known.
 		return nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 
+	start := time.Now()
+	defer func() { log.Printf("AddBlob(%s): %s", br, time.Since(start)) }()
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -320,9 +353,16 @@ func (c *corpusDB) mergeMetaRow(db dbtx, k, v []byte) error {
 	if err != nil {
 		return fmt.Errorf("bogus meta row: %q -> %q", k, v)
 	}
-	_, err = db.Exec(`INSERT OR REPLACE INTO blobs (ref, size, camlitype) VALUES (?, ?, ?)`,
-		br.String(), size, string(camliTypeFromMIME(string(v[pipe+1:]))))
-	return err
+	if _, err = db.Exec(
+		`INSERT OR IGNORE INTO blobs_`+refPartition(br)+` (ref, size, camlitype) VALUES (?, ?, ?)`,
+		br.String(), size, string(camliTypeFromMIME(string(v[pipe+1:]))),
+	); err != nil {
+		if e, ok := errors.AsType[*sqlite.Error](err); ok && e.Code() == 1555 {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *corpusDB) mergeSignerKeyIDRow(db dbtx, k, v []byte) error {
@@ -572,7 +612,10 @@ func (c *corpusDB) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 func (c *corpusDB) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
 	var size uint64
 	var camliType string
-	err := c.db.QueryRow(`SELECT size, camlitype FROM blobs WHERE ref = ?`, br.String()).Scan(&size, &camliType)
+	err := c.db.QueryRow(
+		`SELECT size, camlitype FROM blobs_`+refPartition(br)+` WHERE ref = ?`,
+		br.String(),
+	).Scan(&size, &camliType)
 	if errors.Is(err, sql.ErrNoRows) {
 		return camtypes.BlobMeta{}, os.ErrNotExist
 	}
@@ -1179,7 +1222,17 @@ func (c *corpusDB) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) boo
 }
 
 func (c *corpusDB) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
-	c.enumerateBlobs(`SELECT ref, size, camlitype FROM blobs`, fn)
+	var stop bool
+	fn2 := func(b camtypes.BlobMeta) bool { cont := fn(b); stop = !cont; return cont }
+	for i := range partNum {
+		c.enumerateBlobs(
+			fmt.Sprintf(`SELECT ref, size, camlitype FROM blobs_`+partPat, i),
+			fn2,
+		)
+		if stop {
+			break
+		}
+	}
 }
 
 func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool, args ...any) {
@@ -1205,11 +1258,28 @@ func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool,
 }
 
 func (c *corpusDB) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.BlobMeta) bool) {
+	var stop bool
+	fn2 := func(b camtypes.BlobMeta) bool { cont := fn(b); stop = !cont; return cont }
 	if camType != "" {
-		c.enumerateBlobs(`SELECT ref, size, camlitype FROM blobs WHERE camlitype = ?`, fn, string(camType))
+		for i := range partNum {
+			c.enumerateBlobs(fmt.Sprintf(
+				`SELECT ref, size, camlitype FROM blobs_`+partPat+` WHERE camlitype = ?`,
+				i),
+				fn2, string(camType))
+			if stop {
+				break
+			}
+		}
 		return
 	}
-	c.enumerateBlobs(`SELECT ref, size, camlitype FROM blobs WHERE camlitype != ''`, fn)
+	for i := range partNum {
+		c.enumerateBlobs(fmt.Sprintf(
+			`SELECT ref, size, camlitype FROM blobs_`+partPat+` WHERE camlitype != ''`, i),
+			fn2)
+		if stop {
+			break
+		}
+	}
 }
 
 func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.Ref) {
@@ -1340,4 +1410,8 @@ func signerRefsMatch(refs SignerRefSet, br blob.Ref) bool {
 		}
 	}
 	return false
+}
+
+func refPartition(br blob.Ref) string {
+	return fmt.Sprintf(partPat, br.Sum32()%partNum)
 }
