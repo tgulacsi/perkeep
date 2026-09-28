@@ -68,7 +68,7 @@ type Index struct {
 	// recursive calls on the index.
 	deletes *deletionCache
 
-	corpus *Corpus // or nil, if not being kept in memory
+	corpus Corpus // or nil, if not being kept in memory
 
 	mu sync.RWMutex // guards following
 	//mu syncdebug.RWMutexTracker  // (when debugging)
@@ -976,7 +976,7 @@ func kvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtypes.C
 	}, true
 }
 
-func (c *Corpus) kvClaimBytes(k, v []byte) (cl camtypes.Claim, ok bool) {
+func (c *corpusMem) kvClaimBytes(k, v []byte) (cl camtypes.Claim, ok bool) {
 	sep := []byte{'|'}
 	const nKeyPart, nValPart = 5, 4
 	if bytes.Count(k, sep) < nKeyPart-1 || bytes.Count(v, sep) < nValPart-1 {
@@ -1075,7 +1075,7 @@ func (x *Index) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta
 // HasLegacySHA1 reports whether the index has legacy SHA-1 blobs.
 func (x *Index) HasLegacySHA1() (ok bool, err error) {
 	if x.corpus != nil {
-		return x.corpus.hasLegacySHA1, err
+		return x.corpus.HasLegacySHA1(), err
 	}
 	it := x.queryPrefix(keyWholeToFileRef, "sha1-")
 	defer closeIterator(it, &err)
@@ -1096,7 +1096,7 @@ func (x *Index) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 // does not return an error if none is found.
 func (x *Index) signerRefs(ctx context.Context, keyID string) (SignerRefSet, error) {
 	if x.corpus != nil {
-		return x.corpus.signerRefs[keyID], nil
+		return x.corpus.SignerRefs(keyID), nil
 	}
 	it := x.queryPrefixString(keySignerKeyID.name)
 	var err error

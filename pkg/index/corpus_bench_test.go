@@ -18,6 +18,7 @@ package index_test
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ var (
 	kvForBenchmark sorted.KeyValue
 )
 
-func BenchmarkCorpusFromStorage(b *testing.B) {
+func BenchmarkMemCorpusFromStorage(b *testing.B) {
 	defer test.TLog(b)()
 	buildKvOnce.Do(func() {
 		kvForBenchmark = sorted.NewMemoryKeyValue()
@@ -57,5 +58,34 @@ func BenchmarkCorpusFromStorage(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkDBCorpusFromStorage(b *testing.B) {
+	defer test.TLog(b)()
+	buildKvOnce.Do(func() {
+		kvForBenchmark = sorted.NewMemoryKeyValue()
+		idx, err := index.New(kvForBenchmark)
+		if err != nil {
+			b.Fatal(err)
+		}
+		id := indextest.NewIndexDeps(idx)
+		id.Fataler = b
+		for i := range 10 {
+			fileRef, _ := id.UploadFile("file.txt", fmt.Sprintf("some file %d", i), time.Unix(1382073153, 0))
+			pn := id.NewPlannedPermanode(fmt.Sprint(i))
+			id.SetAttribute(pn, "camliContent", fileRef.String())
+		}
+	})
+	defer index.SetVerboseCorpusLogging(true)
+	index.SetVerboseCorpusLogging(false)
+
+	file := filepath.Join(b.TempDir(), "corpus.db")
+	for b.Loop() {
+		c, err := index.NewDBCorpusFromStorage(file, kvForBenchmark)
+		if err != nil {
+			b.Fatal(err)
+		}
+		c.Close()
 	}
 }

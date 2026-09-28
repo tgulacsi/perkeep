@@ -141,7 +141,7 @@ var testKvClaims = map[kv]camtypes.Claim{
 }
 
 func TestKvClaim(t *testing.T) {
-	var cp Corpus
+	var cp corpusMem
 	for kv, claim := range testKvClaims {
 		kv, claim := kv, claim
 		t.Run(kv.String(), func(t *testing.T) {
@@ -199,7 +199,7 @@ func BenchmarkKvClaimBytes(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
-	var cp Corpus
+	var cp corpusMem
 	for b.Loop() {
 		for _, tC := range bb {
 			c, ok := cp.kvClaimBytes(tC.k, tC.v)
