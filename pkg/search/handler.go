@@ -73,7 +73,7 @@ type Handler struct {
 	// to use.
 	// TODO: this may be required in the future, or folded into the index
 	// interface.
-	corpus *index.Corpus
+	corpus index.Corpus
 
 	lh *index.LocationHelper
 
@@ -129,7 +129,7 @@ func (h *Handler) subscribeToNewBlobs() {
 	}()
 }
 
-func (h *Handler) SetCorpus(c *index.Corpus) {
+func (h *Handler) SetCorpus(c index.Corpus) {
 	h.corpus = c
 	h.lh.SetCorpus(c)
 }

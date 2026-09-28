@@ -30,16 +30,17 @@ import (
 	"perkeep.org/pkg/types/camtypes"
 )
 
-func newTestCorpusWithPermanode(t *testing.T) (c *index.Corpus, pn blob.Ref, keyID1, keyID2 string) {
-	c = index.ExpNewCorpus()
+func newTestCorpusWithPermanode(t *testing.T) (c index.Corpus, pn blob.Ref, keyID1, keyID2 string) {
+	mem := index.ExpNewCorpus()
+	c = mem
 	pn = blob.MustParse("abc-123")
 	sig1 := indextest.PubKey.BlobRef()
 	keyID2 = "abc-789"
 	sig2 := blob.MustParse(keyID2)
-	if err := c.Exp_AddKeyID(sig1, indextest.KeyID); err != nil {
+	if err := mem.Exp_AddKeyID(sig1, indextest.KeyID); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Exp_AddKeyID(sig2, keyID2); err != nil {
+	if err := mem.Exp_AddKeyID(sig2, keyID2); err != nil {
 		t.Fatal(err)
 	}
 	tm := time.Unix(99, 0)
@@ -54,7 +55,7 @@ func newTestCorpusWithPermanode(t *testing.T) (c *index.Corpus, pn blob.Ref, key
 		}
 	}
 
-	c.SetClaims(pn, []*camtypes.Claim{
+	mem.SetClaims(pn, []*camtypes.Claim{
 		claim("set", "foo", "foov", sig1), // time 100
 
 		claim("add", "tag", "a", sig1), // time 101
@@ -311,7 +312,7 @@ func TestKVClaim(t *testing.T) {
 
 func TestDeletePermanode_Modtime(t *testing.T) {
 	testDeletePermanodes(t,
-		func(c *index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
+		func(c index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
 			c.EnumeratePermanodesLastModified(fn)
 			return nil
 		},
@@ -320,7 +321,7 @@ func TestDeletePermanode_Modtime(t *testing.T) {
 
 func TestDeletePermanode_CreateTime(t *testing.T) {
 	testDeletePermanodes(t,
-		func(c *index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
+		func(c index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
 			c.EnumeratePermanodesCreated(fn, true)
 			return nil
 		},
@@ -328,7 +329,7 @@ func TestDeletePermanode_CreateTime(t *testing.T) {
 }
 
 func testDeletePermanodes(t *testing.T,
-	enumFunc func(*index.Corpus, func(m camtypes.BlobMeta) bool) error) {
+	enumFunc func(index.Corpus, func(m camtypes.BlobMeta) bool) error) {
 
 	idx := index.NewMemoryIndex()
 	idxd := indextest.NewIndexDeps(idx)
@@ -399,7 +400,7 @@ func testDeletePermanodes(t *testing.T,
 
 func TestEnumerateOrder_Modtime(t *testing.T) {
 	testEnumerateOrder(t,
-		func(c *index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
+		func(c index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
 			c.EnumeratePermanodesLastModified(fn)
 			return nil
 		},
@@ -409,7 +410,7 @@ func TestEnumerateOrder_Modtime(t *testing.T) {
 
 func TestEnumerateOrder_CreateTime(t *testing.T) {
 	testEnumerateOrder(t,
-		func(c *index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
+		func(c index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
 			c.EnumeratePermanodesCreated(fn, true)
 			return nil
 		},
@@ -423,7 +424,7 @@ const (
 )
 
 func testEnumerateOrder(t *testing.T,
-	enumFunc func(*index.Corpus, func(m camtypes.BlobMeta) bool) error,
+	enumFunc func(index.Corpus, func(m camtypes.BlobMeta) bool) error,
 	order int) {
 	idx := index.NewMemoryIndex()
 	idxd := indextest.NewIndexDeps(idx)
@@ -473,7 +474,7 @@ func testEnumerateOrder(t *testing.T,
 // should be run with -race
 func TestCacheSortedPermanodes_ModtimeRace(t *testing.T) {
 	testCacheSortedPermanodesRace(t,
-		func(c *index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
+		func(c index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
 			c.EnumeratePermanodesLastModified(fn)
 			return nil
 		},
@@ -483,7 +484,7 @@ func TestCacheSortedPermanodes_ModtimeRace(t *testing.T) {
 // should be run with -race
 func TestCacheSortedPermanodes_CreateTimeRace(t *testing.T) {
 	testCacheSortedPermanodesRace(t,
-		func(c *index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
+		func(c index.Corpus, fn func(m camtypes.BlobMeta) bool) error {
 			c.EnumeratePermanodesCreated(fn, true)
 			return nil
 		},
@@ -492,7 +493,7 @@ func TestCacheSortedPermanodes_CreateTimeRace(t *testing.T) {
 
 // TODO(mpl): see later if we can delete. or if we have to fix it further.
 func testCacheSortedPermanodesRace(t *testing.T,
-	enumFunc func(*index.Corpus, func(m camtypes.BlobMeta) bool) error) {
+	enumFunc func(index.Corpus, func(m camtypes.BlobMeta) bool) error) {
 	idx := index.NewMemoryIndex()
 	idxd := indextest.NewIndexDeps(idx)
 	idxd.Fataler = t
@@ -530,7 +531,7 @@ func TestLazySortedPermanodes(t *testing.T) {
 	idx := index.NewMemoryIndex()
 	idxd := indextest.NewIndexDeps(idx)
 	idxd.Fataler = t
-	c, err := idxd.Index.KeepInMemory()
+	c, err := index.ExpKeepInMemory(idxd.Index)
 	if err != nil {
 		t.Fatalf("error slurping index to memory: %v", err)
 	}

@@ -33,15 +33,25 @@ func ExpUnreverseTimeString(s string) string {
 	return unreverseTimeString(s)
 }
 
-func ExpNewCorpus() *Corpus {
+func ExpNewCorpus() *corpusMem {
 	return newCorpus()
 }
 
-func (c *Corpus) Exp_mergeFileInfoRow(k, v string) error {
+// ExpKeepInMemory is KeepInMemory with a concrete result type, for tests
+// that need to inspect the internals of the in-memory corpus.
+func ExpKeepInMemory(x *Index) (*corpusMem, error) {
+	c, err := x.KeepInMemory()
+	if err != nil {
+		return nil, err
+	}
+	return c.(*corpusMem), nil
+}
+
+func (c *corpusMem) Exp_mergeFileInfoRow(k, v string) error {
 	return c.mergeFileInfoRow([]byte(k), []byte(v))
 }
 
-func (c *Corpus) Exp_files(br blob.Ref) camtypes.FileInfo {
+func (c *corpusMem) Exp_files(br blob.Ref) camtypes.FileInfo {
 	return c.files[br]
 }
 
@@ -49,7 +59,7 @@ func ExpKvClaim(k, v string, blobParse func(string) (blob.Ref, bool)) (c camtype
 	return kvClaim(k, v, blobParse)
 }
 
-func (c *Corpus) SetClaims(pn blob.Ref, claims []*camtypes.Claim) {
+func (c *corpusMem) SetClaims(pn blob.Ref, claims []*camtypes.Claim) {
 	pm := &PermanodeMeta{
 		Claims: claims,
 	}
@@ -57,7 +67,7 @@ func (c *Corpus) SetClaims(pn blob.Ref, claims []*camtypes.Claim) {
 	c.permanodes[pn] = pm
 }
 
-func (c *Corpus) Exp_AddKeyID(signerRef blob.Ref, signerID string) error {
+func (c *corpusMem) Exp_AddKeyID(signerRef blob.Ref, signerID string) error {
 	return c.addKeyID(&mutationMap{
 		signerID:      signerID,
 		signerBlobRef: signerRef,
@@ -104,7 +114,7 @@ type ExpPnAndTime pnAndTime
 
 // Exp_LSPByTime returns the sorted cache lazySortedPermanodes for
 // permanodesByTime (or the reverse sorted one).
-func (c *Corpus) Exp_LSPByTime(reverse bool) []ExpPnAndTime {
+func (c *corpusMem) Exp_LSPByTime(reverse bool) []ExpPnAndTime {
 	if c.permanodesByTime == nil {
 		return nil
 	}

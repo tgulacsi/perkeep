@@ -1379,7 +1379,7 @@ func bestByLocation(res *SearchResult, locm map[blob.Ref]camtypes.Location, limi
 
 // setResultContinue sets res.Continue if q is suitable for having a continue token.
 // The corpus is locked for reads.
-func (q *SearchQuery) setResultContinue(corpus *index.Corpus, res *SearchResult) {
+func (q *SearchQuery) setResultContinue(corpus index.Corpus, res *SearchResult) {
 	if !q.Constraint.onlyMatchesPermanode() {
 		return
 	}

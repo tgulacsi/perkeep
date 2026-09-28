@@ -18,7 +18,7 @@ import (
 // Callers should use Lock or RLock on the underlying index instead.
 type LocationHelper struct {
 	index  *Index
-	corpus *Corpus // may be nil
+	corpus Corpus // may be nil
 }
 
 // NewLocationHelper returns a new location handler
@@ -33,7 +33,7 @@ func NewLocationHelper(ix *Index) *LocationHelper {
 
 // SetCorpus sets the corpus to be used
 // for location lookups.
-func (lh *LocationHelper) SetCorpus(corpus *Corpus) {
+func (lh *LocationHelper) SetCorpus(corpus Corpus) {
 	lh.corpus = corpus
 }
 
@@ -66,7 +66,7 @@ func (lh *LocationHelper) permanodeLocation(ctx context.Context,
 	pa := permAttr{at: at, signerFilter: owner.RefSet(signerID)}
 	if lh.corpus != nil {
 		var claims []*camtypes.Claim
-		pa.attrs, claims = lh.corpus.permanodeAttrsOrClaims(pn, at, signerID)
+		pa.attrs, claims = lh.corpus.PermanodeAttrsOrClaims(pn, at, signerID)
 		if claims != nil {
 			pa.claims = claimPtrSlice(claims)
 		}

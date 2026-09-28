@@ -116,6 +116,8 @@ var (
 	// those test files are not specific to an indexer implementation
 	// hence we do not want to check them.
 	notAnIndexer = []string{
+		"corpus_db_test.go",
+		"corpus_db_schema.go",
 		"corpus_bench_test.go",
 		"corpus_test.go",
 		"export_test.go",

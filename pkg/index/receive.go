@@ -59,6 +59,7 @@ func init() {
 	msdosEpochTime = t
 }
 
+// mutationMap holds the index rows to commit when a blob is received.
 type mutationMap struct {
 	// When the mutations are from a claim, signerBlobRef is the signer of the
 	// claim, and signerID is its matching GPG key ID. They are copied out of kv because,
@@ -87,6 +88,23 @@ func (mm *mutationMap) Set(k, v string) {
 func (mm *mutationMap) noteDelete(deleteClaim schema.Claim) {
 	mm.deletes = append(mm.deletes, deleteClaim)
 }
+
+// SignerBlobRef returns the blob ref of the signer of the claim mutations,
+// or the zero blob.Ref if the mutations are not from a claim.
+func (mm *mutationMap) SignerBlobRef() blob.Ref { return mm.signerBlobRef }
+
+// SignerID returns the GPG key ID (e.g. "2931A67C26F5ABDA") matching
+// SignerBlobRef, or "" if SignerBlobRef is not valid.
+func (mm *mutationMap) SignerID() string { return mm.signerID }
+
+// Rows returns the index rows (as key/value pairs) to commit. Some rows
+// are ignored by a Corpus implementation, depending on the key type (the
+// identifier of the key before its first ":" or "|").
+func (mm *mutationMap) Rows() map[string]string { return mm.kv }
+
+// Deletes returns the delete claims to apply to the corpus after the rows
+// are committed.
+func (mm *mutationMap) Deletes() []schema.Claim { return mm.deletes }
 
 func blobsFilteringOut(v []blob.Ref, x blob.Ref) []blob.Ref {
 	switch len(v) {
@@ -283,7 +301,7 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 	}
 
 	if c := ix.corpus; c != nil {
-		if err := c.addBlob(ctx, blobRef, mm); err != nil {
+		if err := c.AddBlob(ctx, blobRef, mm); err != nil {
 			return blob.SizedRef{}, err
 		}
 	}
@@ -304,7 +322,7 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 	return blob.SizedRef{Ref: blobRef, Size: uint32(written)}, nil
 }
 
-// commit writes the contents of the mutationMap on a batch
+// commit writes the contents of the MutationMap on a batch
 // mutation and commits that batch. It also updates the deletes
 // cache.
 func (ix *Index) commit(mm *mutationMap) error {

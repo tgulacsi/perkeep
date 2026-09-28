@@ -119,7 +119,7 @@ func testQueryType(t testing.TB, fn func(*queryTest), itype indexType) {
 
 	idx := index.NewMemoryIndex() // string key-value pairs in memory, as if they were on disk
 	var err error
-	var corpus *index.Corpus
+	var corpus index.Corpus
 	if itype == indexCorpusBuild {
 		if corpus, err = idx.KeepInMemory(); err != nil {
 			t.Fatal(err)
