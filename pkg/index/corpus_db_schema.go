@@ -50,7 +50,9 @@ func openDB(file string) (*sql.DB, error) {
 	}
 	for _, s := range []string{
 		"journal_mode = WAL",
-		"cache_size = -20000",
+		"synchronous = OFF",
+		"cache_size = -40000",
+		"page_size = 16384",
 		"optimize",
 	} {
 		if _, err := db.Exec("PRAGMA " + s); err != nil {
@@ -66,12 +68,14 @@ func openDB(file string) (*sql.DB, error) {
 		size      INTEGER NOT NULL,
 		camlitype TEXT NOT NULL DEFAULT ''
 	) WITHOUT ROWID, STRICT`,
+
 		`CREATE TABLE IF NOT EXISTS signers (
 		signerref TEXT PRIMARY KEY,
 		keyid     TEXT NOT NULL
-	) WITHOUT ROWID, STRICT`,
+	) STRICT`,
 		`CREATE INDEX IF NOT EXISTS signers_by_keyid ON signers(keyid)`,
-		`CREATE TABLE IF NOT EXISTS claims (
+
+		`CREATE TABLE IF NOT EXISTS claims_` + partPat + ` (
 		claimref  TEXT PRIMARY KEY,
 		permanode TEXT NOT NULL,
 		signerref TEXT NOT NULL,
@@ -79,9 +83,14 @@ func openDB(file string) (*sql.DB, error) {
 		type      TEXT NOT NULL DEFAULT '',
 		attr      TEXT NOT NULL DEFAULT '',
 		value     TEXT NOT NULL DEFAULT ''
+	) STRICT`,
+		`CREATE INDEX IF NOT EXISTS claims_by_value_` + partPat + ` ON claims_` + partPat + `(value)`,
+		// `CREATE INDEX IF NOT EXISTS claims_by_permanode ON claims(permanode, date)`,
+		`CREATE TABLE IF NOT EXISTS claims_by_permanode_` + partPat + ` (
+		permanode TEXT PRIMARY KEY,
+		claimref TEXT NOT NULL
 	) WITHOUT ROWID, STRICT`,
-		`CREATE INDEX IF NOT EXISTS claims_by_permanode ON claims(permanode, date)`,
-		`CREATE INDEX IF NOT EXISTS claims_by_value ON claims(value)`,
+
 		`CREATE TABLE IF NOT EXISTS files (
 		fileref  TEXT PRIMARY KEY,
 		size     INTEGER NOT NULL DEFAULT 0,
@@ -90,12 +99,12 @@ func openDB(file string) (*sql.DB, error) {
 		wholeref TEXT NOT NULL DEFAULT '',
 		time     INTEGER, -- unix nanos, NULL if unknown
 		modtime  INTEGER  -- unix nanos, NULL if unknown
-	) WITHOUT ROWID, STRICT`,
+	) STRICT`,
 		`CREATE INDEX IF NOT EXISTS files_by_wholeref ON files(wholeref)`,
 		`CREATE TABLE IF NOT EXISTS wholetofile (
 		fileref  TEXT PRIMARY KEY,
 		wholeref TEXT NOT NULL
-	) WITHOUT ROWID, STRICT`,
+	) STRICT`,
 		`CREATE INDEX IF NOT EXISTS wholetofile_by_wholeref ON wholetofile(wholeref)`,
 		`CREATE TABLE IF NOT EXISTS imagesizes (
 		fileref TEXT PRIMARY KEY,
@@ -123,29 +132,68 @@ func openDB(file string) (*sql.DB, error) {
 		parent TEXT NOT NULL,
 		PRIMARY KEY (child, parent)
 	) STRICT`,
+
 		`CREATE TABLE IF NOT EXISTS deletes (
 		deleted TEXT NOT NULL,
 		deleter TEXT NOT NULL,
 		deltime INTEGER NOT NULL, -- unix nanos
 		PRIMARY KEY (deleted, deleter)
 	) STRICT`,
+
 		`CREATE TABLE IF NOT EXISTS meta (
 		metakey TEXT PRIMARY KEY,
 		value   TEXT NOT NULL
-	) STRICT`,
+	) WITHOUT ROWID, STRICT`,
 	} {
-		if strings.Contains(stmt, "_"+partPat) {
+		if n := strings.Count(stmt, "_"+partPat); n > 0 {
 			for i := range partNum {
-				stmt := fmt.Sprintf(stmt, i)
+				stmt := fmt.Sprintf(stmt, []any{i, i}[:n]...)
 				if _, err := db.Exec(stmt); err != nil {
-					return nil, fmt.Errorf("dbcorpus: initializing schema: %s: %w", stmt, err)
+					return nil, fmt.Errorf("initializing schema: %s: %w", stmt, err)
 				}
 			}
 		} else if _, err := db.Exec(stmt); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("dbcorpus: initializing schema: %s: %w", stmt, err)
+			return nil, fmt.Errorf("initializing schema: %s: %w", stmt, err)
 		}
 	}
+	var buf strings.Builder
+	buf.WriteString(`CREATE VIEW IF NOT EXISTS blobs AS `)
+	for i := range partNum {
+		if i != 0 {
+			buf.WriteString(" UNION ALL ")
+		}
+		fmt.Fprintf(&buf, `SELECT ref, size, camlitype FROM blobs_`+partPat, i)
+	}
+	if _, err := db.Exec(buf.String()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initializing schema: %s: %w", buf.String(), err)
+	}
+	buf.Reset()
+	buf.WriteString(`CREATE VIEW IF NOT EXISTS claims AS `)
+	for i := range partNum {
+		if i != 0 {
+			buf.WriteString(" UNION ALL ")
+		}
+		fmt.Fprintf(&buf, `SELECT claimref, permanode, signerref, date, type, attr, value FROM claims_`+partPat, i)
+	}
+	if _, err := db.Exec(buf.String()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initializing schema: %s: %w", buf.String(), err)
+	}
+	buf.Reset()
+	buf.WriteString(`CREATE VIEW IF NOT EXISTS claims_by_permanode AS `)
+	for i := range partNum {
+		if i != 0 {
+			buf.WriteString(" UNION ALL ")
+		}
+		fmt.Fprintf(&buf, `SELECT permanode, claimref FROM claims_by_permanode_`+partPat, i)
+	}
+	if _, err := db.Exec(buf.String()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initializing schema: %s: %w", buf.String(), err)
+	}
+
 	var version string
 	err = db.QueryRow(`SELECT value FROM meta WHERE metakey = ?`, metaSchemaVersion).Scan(&version)
 	switch {
@@ -161,7 +209,7 @@ func openDB(file string) (*sql.DB, error) {
 	default:
 		if version != fmt.Sprint(requiredSchemaVersion) {
 			db.Close()
-			return nil, fmt.Errorf("dbcorpus: schema version mismatch: have %v, want %v", version, requiredSchemaVersion)
+			return nil, fmt.Errorf("schema version mismatch: have %v, want %v", version, requiredSchemaVersion)
 		}
 	}
 	return db, nil

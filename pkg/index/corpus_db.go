@@ -187,7 +187,7 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 		batchSize++
 		if batchSize > 32767 {
 			now := time.Now()
-			log.Printf("%d: %s", batchSize, now.Sub(start))
+			log.Printf("%d[%s]: %s", batchSize, it.Key(), now.Sub(start))
 			start = now
 			batchSize = 0
 			if err = tx.Commit(); err != nil {
@@ -378,7 +378,18 @@ func (c *corpusDB) mergeClaimRow(db dbtx, k, v []byte) error {
 	if !ok || !cl.Permanode.Valid() {
 		return fmt.Errorf("bogus claim row: %q -> %q", k, v)
 	}
-	_, err := db.Exec(`INSERT OR REPLACE INTO claims
+	if cl.Permanode.Valid() {
+		if _, err := db.Exec(
+			`INSERT OR REPLACE INTO claims_by_permanode_`+refPartition(cl.Permanode)+`
+		(permanode, claimref)
+		VALUES (?, ?)`,
+			cl.Permanode.String(), cl.BlobRef.String(),
+		); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(
+		`INSERT OR REPLACE INTO claims_`+refPartition(cl.BlobRef)+`
 		(claimref, permanode, signerref, date, type, attr, value)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		cl.BlobRef.String(), cl.Permanode.String(), cl.Signer.String(),
@@ -795,8 +806,17 @@ func (c *corpusDB) childRefs(query string, br blob.Ref) (map[blob.Ref]struct{}, 
 
 // claimsOf returns the claims of the permanode pn, sorted by date.
 func (c *corpusDB) claimsOf(pn blob.Ref) ([]*camtypes.Claim, error) {
+	var claim string
+	err := c.db.QueryRow(`SELECT claimref FROM claims_by_permanode_`+refPartition(pn)+` WHERE permanode = ?`, pn.String()).Scan(&claim)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	cr := blob.RefFromString(claim)
 	rows, err := c.db.Query(`SELECT claimref, signerref, permanode, date, type, attr, value
-		FROM claims WHERE permanode = ? ORDER BY date, claimref`, pn.String())
+		FROM claims_`+refPartition(cr)+` WHERE claimref = ? ORDER BY date`, cr.String())
 	if err != nil {
 		return nil, err
 	}
@@ -976,8 +996,10 @@ func (c *corpusDB) ForeachClaim(permaNode blob.Ref, at time.Time, fn func(*camty
 }
 
 func (c *corpusDB) ForeachClaimBack(value blob.Ref, at time.Time, fn func(*camtypes.Claim) bool) {
-	rows, err := c.db.Query(`SELECT claimref, signerref, permanode, date, type, attr, value
-		FROM claims WHERE value = ? ORDER BY date, claimref`, value.String())
+	rows, err := c.db.Query(
+		`SELECT claimref, signerref, permanode, date, type, attr, value
+		FROM claims WHERE value = ? ORDER BY date, claimref`,
+		value.String())
 	if err != nil {
 		return
 	}
@@ -1138,12 +1160,12 @@ func (c *corpusDB) PermanodeAttrsOrClaims(permaNode blob.Ref,
 }
 
 func (c *corpusDB) listPermanodes(pnTime func(blob.Ref) (time.Time, bool), reverse bool) ([]pnAndTime, error) {
-	rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims`)
+	var pns []pnAndTime
+	rows, err := c.db.Query(`SELECT permanode FROM claims_by_permanode`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var pns []pnAndTime
 	for rows.Next() {
 		var s string
 		if err := rows.Scan(&s); err != nil {
@@ -1198,7 +1220,9 @@ func (c *corpusDB) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, n
 
 func (c *corpusDB) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool, camliNodeTypes []string) {
 	for _, typ := range camliNodeTypes {
-		rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims WHERE attr = 'camliNodeType' AND value = ?`, typ)
+		rows, err := c.db.Query(
+			`SELECT DISTINCT permanode FROM claims WHERE attr = 'camliNodeType' AND permanode IS NOT NULL AND value = ?`,
+			typ)
 		if err != nil {
 			return
 		}
@@ -1222,17 +1246,7 @@ func (c *corpusDB) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) boo
 }
 
 func (c *corpusDB) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
-	var stop bool
-	fn2 := func(b camtypes.BlobMeta) bool { cont := fn(b); stop = !cont; return cont }
-	for i := range partNum {
-		c.enumerateBlobs(
-			fmt.Sprintf(`SELECT ref, size, camlitype FROM blobs_`+partPat, i),
-			fn2,
-		)
-		if stop {
-			break
-		}
-	}
+	c.enumerateBlobs(`SELECT ref, size, camlitype FROM blobs`, fn)
 }
 
 func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool, args ...any) {
@@ -1258,28 +1272,14 @@ func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool,
 }
 
 func (c *corpusDB) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.BlobMeta) bool) {
-	var stop bool
-	fn2 := func(b camtypes.BlobMeta) bool { cont := fn(b); stop = !cont; return cont }
 	if camType != "" {
-		for i := range partNum {
-			c.enumerateBlobs(fmt.Sprintf(
-				`SELECT ref, size, camlitype FROM blobs_`+partPat+` WHERE camlitype = ?`,
-				i),
-				fn2, string(camType))
-			if stop {
-				break
-			}
-		}
-		return
+		c.enumerateBlobs(
+			`SELECT ref, size, camlitype FROM blobs WHERE camlitype = ?`,
+			fn, string(camType))
 	}
-	for i := range partNum {
-		c.enumerateBlobs(fmt.Sprintf(
-			`SELECT ref, size, camlitype FROM blobs_`+partPat+` WHERE camlitype != ''`, i),
-			fn2)
-		if stop {
-			break
-		}
-	}
+	c.enumerateBlobs(
+		`SELECT ref, size, camlitype FROM blobs WHERE camlitype != ''`,
+		fn)
 }
 
 func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.Ref) {
@@ -1290,11 +1290,11 @@ func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.
 }
 
 func (c *corpusDB) IterPermanodes() iter.Seq[blob.Ref] {
-	rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims WHERE permanode IS NOT NULL`)
-	if err != nil {
-		panic(err)
-	}
 	return func(yield func(blob.Ref) bool) {
+		rows, err := c.db.Query(`SELECT permanode FROM claims_by_permanode`)
+		if err != nil {
+			panic(err)
+		}
 		defer rows.Close()
 		for rows.Next() {
 			var pn string
