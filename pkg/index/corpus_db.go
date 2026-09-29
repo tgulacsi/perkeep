@@ -170,7 +170,7 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 	var tx *sql.Tx
 	defer func() {
 		if tx != nil {
-			tx.Commit()
+			tx.Rollback()
 		}
 	}()
 	start := time.Now()
