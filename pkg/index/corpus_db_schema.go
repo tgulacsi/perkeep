@@ -87,8 +87,9 @@ func openDB(file string) (*sql.DB, error) {
 		`CREATE INDEX IF NOT EXISTS claims_by_value_` + partPat + ` ON claims_` + partPat + `(value)`,
 		// `CREATE INDEX IF NOT EXISTS claims_by_permanode ON claims(permanode, date)`,
 		`CREATE TABLE IF NOT EXISTS claims_by_permanode_` + partPat + ` (
-		permanode TEXT PRIMARY KEY,
-		claimref TEXT NOT NULL
+		permanode TEXT NOT NULL,
+		claimref TEXT NOT NULL,
+		PRIMARY KEY (permanode, claimref)
 	) WITHOUT ROWID, STRICT`,
 
 		`CREATE TABLE IF NOT EXISTS files (

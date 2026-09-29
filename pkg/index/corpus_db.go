@@ -806,39 +806,55 @@ func (c *corpusDB) childRefs(query string, br blob.Ref) (map[blob.Ref]struct{}, 
 
 // claimsOf returns the claims of the permanode pn, sorted by date.
 func (c *corpusDB) claimsOf(pn blob.Ref) ([]*camtypes.Claim, error) {
-	var claim string
-	err := c.db.QueryRow(`SELECT claimref FROM claims_by_permanode_`+refPartition(pn)+` WHERE permanode = ?`, pn.String()).Scan(&claim)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	cr := blob.RefFromString(claim)
-	rows, err := c.db.Query(`SELECT claimref, signerref, permanode, date, type, attr, value
-		FROM claims_`+refPartition(cr)+` WHERE claimref = ? ORDER BY date`, cr.String())
+	rows, err := c.db.Query(
+		`SELECT claimref FROM claims_by_permanode_`+refPartition(pn)+` WHERE permanode = ?`,
+		pn.String())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var claims []*camtypes.Claim
+	var claimRefs []string
 	for rows.Next() {
-		cl, err := scanClaim(rows)
+		var claimRef string
+		if err := rows.Scan(&claimRef); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		claimRefs = append(claimRefs, claimRef)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var claims []*camtypes.Claim
+	for _, claimRef := range claimRefs {
+		cr := blob.ParseOrZero(claimRef)
+		row := c.db.QueryRow(`SELECT claimref, signerref, permanode, date, type, attr, value
+			FROM claims_`+refPartition(cr)+` WHERE claimref = ?`, cr.String())
+		cl, err := scanClaim(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		claims = append(claims, cl)
 	}
-	return claims, rows.Err()
+	sort.Slice(claims, func(i, j int) bool { return claims[i].Date.Before(claims[j].Date) })
+	return claims, nil
 }
 
-func scanClaim(rows *sql.Rows) (*camtypes.Claim, error) {
+// rowScanner is implemented by both *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanClaim(row rowScanner) (*camtypes.Claim, error) {
 	var (
 		claimRef, signerRef, permanode string
 		dateN                          int64
 		typ, attr, value               string
 	)
-	if err := rows.Scan(&claimRef, &signerRef, &permanode, &dateN, &typ, &attr, &value); err != nil {
+	if err := row.Scan(&claimRef, &signerRef, &permanode, &dateN, &typ, &attr, &value); err != nil {
 		return nil, err
 	}
 	return &camtypes.Claim{
@@ -1161,7 +1177,7 @@ func (c *corpusDB) PermanodeAttrsOrClaims(permaNode blob.Ref,
 
 func (c *corpusDB) listPermanodes(pnTime func(blob.Ref) (time.Time, bool), reverse bool) ([]pnAndTime, error) {
 	var pns []pnAndTime
-	rows, err := c.db.Query(`SELECT permanode FROM claims_by_permanode`)
+	rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims_by_permanode`)
 	if err != nil {
 		return nil, err
 	}
@@ -1272,14 +1288,15 @@ func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool,
 }
 
 func (c *corpusDB) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.BlobMeta) bool) {
-	if camType != "" {
+	if camType == "" {
 		c.enumerateBlobs(
-			`SELECT ref, size, camlitype FROM blobs WHERE camlitype = ?`,
-			fn, string(camType))
+			`SELECT ref, size, camlitype FROM blobs WHERE camlitype != ''`,
+			fn)
+		return
 	}
 	c.enumerateBlobs(
-		`SELECT ref, size, camlitype FROM blobs WHERE camlitype != ''`,
-		fn)
+		`SELECT ref, size, camlitype FROM blobs WHERE camlitype = ?`,
+		fn, string(camType))
 }
 
 func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.Ref) {
@@ -1291,7 +1308,7 @@ func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.
 
 func (c *corpusDB) IterPermanodes() iter.Seq[blob.Ref] {
 	return func(yield func(blob.Ref) bool) {
-		rows, err := c.db.Query(`SELECT permanode FROM claims_by_permanode`)
+		rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims_by_permanode`)
 		if err != nil {
 			panic(err)
 		}
@@ -1301,7 +1318,7 @@ func (c *corpusDB) IterPermanodes() iter.Seq[blob.Ref] {
 			if err := rows.Scan(&pn); err != nil {
 				panic(err)
 			}
-			if !yield(blob.RefFromString(pn)) {
+			if !yield(blob.ParseOrZero(pn)) {
 				return
 			}
 		}
