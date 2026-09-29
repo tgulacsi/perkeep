@@ -62,12 +62,12 @@ func TestDBCorpusReceive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dc, err := index.NewCorpusDB(filepath.Join(t.TempDir(), "corpus.db"))
+	db, err := index.NewCorpusDB(filepath.Join(t.TempDir(), "corpus.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dc.Close()
-	idx.SetCorpus(dc)
+	defer db.Close()
+	idx.SetCorpus(db)
 
 	id := indextest.NewIndexDeps(idx)
 	id.Fataler = t
@@ -85,7 +85,7 @@ func TestDBCorpusReceive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	compare(t, mem, dc)
+	compare(t, mem, db)
 }
 
 func setRows(t *testing.T, kv sorted.KeyValue) {
@@ -198,15 +198,15 @@ func reverseTimeString(s string) string {
 	return b.String()
 }
 
-// compare checks that the dbcorpus dc is equivalent to the in-memory
+// compare checks that the db corpus is equivalent to the in-memory
 // corpus mem for all the data reachable from mem.
-func compare(t *testing.T, mem, dc index.Corpus) {
+func compare(t *testing.T, mem, db index.Corpus) {
 	t.Helper()
 	ctx := context.Background()
 
 	refs := collectRefs(mem.EnumerateBlobMeta)
-	if got := collectRefs(dc.EnumerateBlobMeta); !reflect.DeepEqual(refs, got) {
-		t.Errorf("EnumerateBlobMeta: mem=%v dc=%v", refs, got)
+	if got := collectRefs(db.EnumerateBlobMeta); !reflect.DeepEqual(refs, got) {
+		t.Errorf("EnumerateBlobMeta: mem=%v db=%v", refs, got)
 	}
 
 	camliTypes := map[string]bool{"": true}
@@ -221,20 +221,20 @@ func compare(t *testing.T, mem, dc index.Corpus) {
 	}
 	for typ := range camliTypes {
 		m := func(fn func(camtypes.BlobMeta) bool) { mem.EnumerateCamliBlobs(schema.CamliType(typ), fn) }
-		d := func(fn func(camtypes.BlobMeta) bool) { dc.EnumerateCamliBlobs(schema.CamliType(typ), fn) }
+		d := func(fn func(camtypes.BlobMeta) bool) { db.EnumerateCamliBlobs(schema.CamliType(typ), fn) }
 		if got, want := collectRefs(d), collectRefs(m); !reflect.DeepEqual(got, want) {
-			t.Errorf("EnumerateCamliBlobs(%q): mem=%v dc=%v", typ, want, got)
+			t.Errorf("EnumerateCamliBlobs(%q): mem[%d]=%v db[%d]=%v", typ, len(want), want, len(got), got)
 		}
 	}
 
 	for _, br := range refs {
 		m, merr := mem.GetBlobMeta(ctx, br)
-		d, derr := dc.GetBlobMeta(ctx, br)
+		d, derr := db.GetBlobMeta(ctx, br)
 		if !sameErr(merr, derr) || !reflect.DeepEqual(m, d) {
-			t.Errorf("GetBlobMeta(%v): mem=(%+v,%v) dc=(%+v,%v)", br, m, merr, d, derr)
+			t.Errorf("GetBlobMeta(%v): mem=(%+v,%v) db=(%+v,%v)", br, m, merr, d, derr)
 		}
-		if got, want := dc.IsDeleted(br), mem.IsDeleted(br); got != want {
-			t.Errorf("IsDeleted(%v): mem=%v dc=%v", br, want, got)
+		if got, want := db.IsDeleted(br), mem.IsDeleted(br); got != want {
+			t.Errorf("IsDeleted(%v): mem=%v db=%v", br, want, got)
 		}
 	}
 
@@ -243,26 +243,26 @@ func compare(t *testing.T, mem, dc index.Corpus) {
 	signers := map[blob.Ref]bool{}
 	nodeTypes := map[string]bool{}
 	for _, pn := range refsOfType(ctx, t, mem, refs, "permanode") {
-		if got, want := collectClaims(dc, pn), collectClaims(mem, pn); !reflect.DeepEqual(got, want) {
-			t.Errorf("AppendClaims(%v): mem=%v dc=%v", pn, want, got)
+		if got, want := collectClaims(db, pn), collectClaims(mem, pn); !reflect.DeepEqual(got, want) {
+			t.Errorf("AppendClaims(%v): mem=%v db=%v", pn, want, got)
 		}
 		for _, at := range []time.Time{old, time.Unix(102, 0).UTC(), time.Unix(200, 0).UTC(), future} {
 			mm, mc := mem.PermanodeAttrsOrClaims(pn, at, "")
-			dm, dcl := dc.PermanodeAttrsOrClaims(pn, at, "")
+			dm, dcl := db.PermanodeAttrsOrClaims(pn, at, "")
 			if !reflect.DeepEqual(mm, dm) || !reflect.DeepEqual(claimRefs(mc), claimRefs(dcl)) {
-				t.Errorf("PermanodeAttrsOrClaims(%v,%v): mem=(%v,%v) dc=(%v,%v)",
+				t.Errorf("PermanodeAttrsOrClaims(%v,%v): mem=(%v,%v) db=(%v,%v)",
 					pn, at, mm, claimRefs(mc), dm, claimRefs(dcl))
 			}
 		}
 		mt, mok := mem.PermanodeModtime(pn)
-		dt, dok := dc.PermanodeModtime(pn)
+		dt, dok := db.PermanodeModtime(pn)
 		if !mt.Equal(dt) || mok != dok {
-			t.Errorf("PermanodeModtime(%v): mem=(%v,%v) dc=(%v,%v)", pn, mt, mok, dt, dok)
+			t.Errorf("PermanodeModtime(%v): mem=(%v,%v) db=(%v,%v)", pn, mt, mok, dt, dok)
 		}
 		mt, mok = mem.PermanodeAnyTime(pn)
-		dt, dok = dc.PermanodeAnyTime(pn)
+		dt, dok = db.PermanodeAnyTime(pn)
 		if !mt.Equal(dt) || mok != dok {
-			t.Errorf("PermanodeAnyTime(%v): mem=(%v,%v) dc=(%v,%v)", pn, mt, mok, dt, dok)
+			t.Errorf("PermanodeAnyTime(%v): mem=(%v,%v) db=(%v,%v)", pn, mt, mok, dt, dok)
 		}
 
 		attrs := map[string]bool{}
@@ -275,42 +275,42 @@ func compare(t *testing.T, mem, dc index.Corpus) {
 		}
 		for attr := range attrs {
 			for _, at := range []time.Time{old, time.Unix(102, 0).UTC(), time.Unix(200, 0).UTC(), future} {
-				if got, want := mem.PermanodeAttrValue(pn, attr, at, ""), dc.PermanodeAttrValue(pn, attr, at, ""); got != want {
-					t.Errorf("PermanodeAttrValue(%v,%q,%v): mem=%q dc=%q", pn, attr, at, want, got)
+				if got, want := mem.PermanodeAttrValue(pn, attr, at, ""), db.PermanodeAttrValue(pn, attr, at, ""); got != want {
+					t.Errorf("PermanodeAttrValue(%v,%q,%v): mem=%q db=%q", pn, attr, at, want, got)
 				}
-				if got, want := mem.PermanodeHasAttrValue(pn, at, attr, "a"), dc.PermanodeHasAttrValue(pn, at, attr, "a"); got != want {
-					t.Errorf("PermanodeHasAttrValue(%v,%q,%v): mem=%v dc=%v", pn, attr, at, want, got)
+				if got, want := mem.PermanodeHasAttrValue(pn, at, attr, "a"), db.PermanodeHasAttrValue(pn, at, attr, "a"); got != want {
+					t.Errorf("PermanodeHasAttrValue(%v,%q,%v): mem=%v db=%v", pn, attr, at, want, got)
 				}
 				mg := mem.AppendPermanodeAttrValues(nil, pn, attr, at, "")
-				dg := dc.AppendPermanodeAttrValues(nil, pn, attr, at, "")
+				dg := db.AppendPermanodeAttrValues(nil, pn, attr, at, "")
 				if !reflect.DeepEqual(mg, dg) {
-					t.Errorf("AppendPermanodeAttrValues(%v,%q,%v): mem=%v dc=%v", pn, attr, at, mg, dg)
+					t.Errorf("AppendPermanodeAttrValues(%v,%q,%v): mem=%v db=%v", pn, attr, at, mg, dg)
 				}
 			}
 		}
-		if got, want := collectForeachClaim(dc, pn), collectForeachClaim(mem, pn); !reflect.DeepEqual(got, want) {
-			t.Errorf("ForeachClaim(%v): mem=%v dc=%v", pn, want, got)
+		if got, want := collectForeachClaim(db, pn), collectForeachClaim(mem, pn); !reflect.DeepEqual(got, want) {
+			t.Errorf("ForeachClaim(%v): mem=%v db=%v", pn, want, got)
 		}
 	}
 
 	// ForeachClaimBack and KeyId for every claim value/signer.
 	for _, br := range refs {
-		if got, want := collectForeachBack(dc, br), collectForeachBack(mem, br); !reflect.DeepEqual(got, want) {
-			t.Errorf("ForeachClaimBack(%v): mem=%v dc=%v", br, want, got)
+		if got, want := collectForeachBack(db, br), collectForeachBack(mem, br); !reflect.DeepEqual(got, want) {
+			t.Errorf("ForeachClaimBack(%v): mem=%v db=%v", br, want, got)
 		}
 	}
 	for s := range signers {
 		mk, merr := mem.KeyId(ctx, s)
-		dk, derr := dc.KeyId(ctx, s)
+		dk, derr := db.KeyId(ctx, s)
 		if !sameErr(merr, derr) || mk != dk {
-			t.Errorf("KeyId(%v): mem=(%q,%v) dc=(%q,%v)", s, mk, merr, dk, derr)
+			t.Errorf("KeyId(%v): mem=(%q,%v) db=(%q,%v)", s, mk, merr, dk, derr)
 		}
-		if got, want := dc.SignerRefs(mk), mem.SignerRefs(mk); !reflect.DeepEqual(got, want) {
-			t.Errorf("SignerRefs(%q): mem=%v dc=%v", mk, want, got)
+		if got, want := db.SignerRefs(mk), mem.SignerRefs(mk); !reflect.DeepEqual(got, want) {
+			t.Errorf("SignerRefs(%q): mem=%v db=%v", mk, want, got)
 		}
 	}
-	if got, want := dc.HasLegacySHA1(), mem.HasLegacySHA1(); got != want {
-		t.Errorf("HasLegacySHA1: mem=%v dc=%v", want, got)
+	if got, want := db.HasLegacySHA1(), mem.HasLegacySHA1(); got != want {
+		t.Errorf("HasLegacySHA1: mem=%v db=%v", want, got)
 	}
 
 	// File and directory lookups.
@@ -318,56 +318,56 @@ func compare(t *testing.T, mem, dc index.Corpus) {
 	files = append(files, refsOfType(ctx, t, mem, refs, "directory")...)
 	for _, f := range files {
 		mfi, merr := mem.GetFileInfo(ctx, f)
-		dfi, derr := dc.GetFileInfo(ctx, f)
+		dfi, derr := db.GetFileInfo(ctx, f)
 		if !sameErr(merr, derr) || !sameFileInfo(mfi, dfi) {
-			t.Errorf("GetFileInfo(%v): mem=(%+v,%v) dc=(%+v,%v)", f, mfi, merr, dfi, derr)
+			t.Errorf("GetFileInfo(%v): mem=(%+v,%v) db=(%+v,%v)", f, mfi, merr, dfi, derr)
 		}
 		mii, merr := mem.GetImageInfo(ctx, f)
-		dii, derr := dc.GetImageInfo(ctx, f)
+		dii, derr := db.GetImageInfo(ctx, f)
 		if !sameErr(merr, derr) || !reflect.DeepEqual(mii, dii) {
-			t.Errorf("GetImageInfo(%v): mem=(%+v,%v) dc=(%+v,%v)", f, mii, merr, dii, derr)
+			t.Errorf("GetImageInfo(%v): mem=(%+v,%v) db=(%+v,%v)", f, mii, merr, dii, derr)
 		}
 		mtags, merr := mem.GetMediaTags(ctx, f)
-		dtags, derr := dc.GetMediaTags(ctx, f)
+		dtags, derr := db.GetMediaTags(ctx, f)
 		if !sameErr(merr, derr) || !reflect.DeepEqual(mtags, dtags) {
-			t.Errorf("GetMediaTags(%v): mem=(%v,%v) dc=(%v,%v)", f, mtags, merr, dtags, derr)
+			t.Errorf("GetMediaTags(%v): mem=(%v,%v) db=(%v,%v)", f, mtags, merr, dtags, derr)
 		}
 		mwr, mok := mem.GetWholeRef(ctx, f)
-		dwr, dok := dc.GetWholeRef(ctx, f)
+		dwr, dok := db.GetWholeRef(ctx, f)
 		if mwr != dwr || mok != dok {
-			t.Errorf("GetWholeRef(%v): mem=(%v,%v) dc=(%v,%v)", f, mwr, mok, dwr, dok)
+			t.Errorf("GetWholeRef(%v): mem=(%v,%v) db=(%v,%v)", f, mwr, mok, dwr, dok)
 		}
 		mlat, mlong, mok := mem.FileLatLong(f)
-		dlat, dlong, dok := dc.FileLatLong(f)
+		dlat, dlong, dok := db.FileLatLong(f)
 		if mlat != dlat || mlong != dlong || mok != dok {
-			t.Errorf("FileLatLong(%v): mem=(%v,%v,%v) dc=(%v,%v,%v)", f, mlat, mlong, mok, dlat, dlong, dok)
+			t.Errorf("FileLatLong(%v): mem=(%v,%v,%v) db=(%v,%v,%v)", f, mlat, mlong, mok, dlat, dlong, dok)
 		}
 		md, merr := mem.GetDirChildren(ctx, f)
-		dd, derr := dc.GetDirChildren(ctx, f)
+		dd, derr := db.GetDirChildren(ctx, f)
 		if !sameErr(merr, derr) || !reflect.DeepEqual(md, dd) {
-			t.Errorf("GetDirChildren(%v): mem=(%v,%v) dc=(%v,%v)", f, md, merr, dd, derr)
+			t.Errorf("GetDirChildren(%v): mem=(%v,%v) db=(%v,%v)", f, md, merr, dd, derr)
 		}
 		mp, merr := mem.GetParentDirs(ctx, f)
-		dp, derr := dc.GetParentDirs(ctx, f)
+		dp, derr := db.GetParentDirs(ctx, f)
 		if !sameErr(merr, derr) || !reflect.DeepEqual(mp, dp) {
-			t.Errorf("GetParentDirs(%v): mem=(%v,%v) dc=(%v,%v)", f, mp, merr, dp, derr)
+			t.Errorf("GetParentDirs(%v): mem=(%v,%v) db=(%v,%v)", f, mp, merr, dp, derr)
 		}
 	}
 
 	// Permanode enumerations.
-	if got, want := collectRefs(mem.EnumeratePermanodesLastModified), collectRefs(dc.EnumeratePermanodesLastModified); !reflect.DeepEqual(got, want) {
-		t.Errorf("EnumeratePermanodesLastModified: mem=%v dc=%v", got, want)
+	if got, want := collectRefs(mem.EnumeratePermanodesLastModified), collectRefs(db.EnumeratePermanodesLastModified); !reflect.DeepEqual(got, want) {
+		t.Errorf("EnumeratePermanodesLastModified: mem=%v db=%v", got, want)
 	}
 	mCreated := func(fn func(camtypes.BlobMeta) bool) { mem.EnumeratePermanodesCreated(fn, true) }
-	dCreated := func(fn func(camtypes.BlobMeta) bool) { dc.EnumeratePermanodesCreated(fn, true) }
+	dCreated := func(fn func(camtypes.BlobMeta) bool) { db.EnumeratePermanodesCreated(fn, true) }
 	if got, want := collectRefs(mCreated), collectRefs(dCreated); !reflect.DeepEqual(got, want) {
-		t.Errorf("EnumeratePermanodesCreated: mem=%v dc=%v", got, want)
+		t.Errorf("EnumeratePermanodesCreated: mem=%v db=%v", got, want)
 	}
 	for typ := range nodeTypes {
 		m := func(fn func(camtypes.BlobMeta) bool) { mem.EnumeratePermanodesByNodeTypes(fn, []string{typ}) }
-		d := func(fn func(camtypes.BlobMeta) bool) { dc.EnumeratePermanodesByNodeTypes(fn, []string{typ}) }
+		d := func(fn func(camtypes.BlobMeta) bool) { db.EnumeratePermanodesByNodeTypes(fn, []string{typ}) }
 		if got, want := collectRefs(d), collectRefs(m); !reflect.DeepEqual(got, want) {
-			t.Errorf("EnumeratePermanodesByNodeTypes(%q): mem=%v dc=%v", typ, want, got)
+			t.Errorf("EnumeratePermanodesByNodeTypes(%q): mem=%v db=%v", typ, want, got)
 		}
 	}
 }
