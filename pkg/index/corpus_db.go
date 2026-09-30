@@ -32,9 +32,11 @@ import (
 	"strings"
 	"time"
 
+	"go4.org/syncutil/singleflight"
 	"go4.org/types"
 	"modernc.org/sqlite"
 
+	"perkeep.org/internal/lru"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/schema"
 	"perkeep.org/pkg/schema/nodeattr"
@@ -61,7 +63,9 @@ func NewDBCorpusFromStorage(file string, s sorted.KeyValue) (*corpusDB, error) {
 // A corpusDB is safe for concurrent use, as long as AddBlob is not invoked
 // concurrently for the same blob.
 type corpusDB struct {
-	db *sql.DB
+	db             *sql.DB
+	claimsCache    *lru.Cache
+	singleClaimsOf *singleflight.Group
 
 	// gen is incremented on every blob received.
 	// It's used as a query cache invalidator.
@@ -86,8 +90,8 @@ func NewCorpusDB(file string) (*corpusDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &corpusDB{db: db}
-	rows, err := db.Query(`SELECT metakey, value FROM meta`)
+	c := &corpusDB{db: db, claimsCache: lru.New(1000), singleClaimsOf: new(singleflight.Group)}
+	rows, err := dbQuery(db, `SELECT metakey, value FROM meta`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -165,6 +169,9 @@ func (c *corpusDB) ScanFromStorage(s sorted.KeyValue) error {
 }
 
 func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
+	if os.Getenv("SKIP_SCAN_PREFIX") == "1" {
+		return nil
+	}
 	it := s.Find(prefix, prefixEnd(prefix))
 	defer closeIterator(it, &err)
 	var tx *sql.Tx
@@ -173,8 +180,8 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 			tx.Rollback()
 		}
 	}()
-	start := time.Now()
 	var batchSize int
+	lastCommit := time.Now()
 	for it.Next() {
 		if tx == nil {
 			if tx, err = c.db.Begin(); err != nil {
@@ -185,15 +192,20 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 			return err
 		}
 		batchSize++
-		if batchSize > 32767 {
+		if batchSize%1000 == 0 {
 			now := time.Now()
-			log.Printf("%d[%s]: %s", batchSize, it.Key(), now.Sub(start))
-			start = now
-			batchSize = 0
-			if err = tx.Commit(); err != nil {
-				return err
+			const minDur = time.Minute
+			if dur := now.Sub(lastCommit); dur >= minDur {
+				log.Printf("%.3f1/m @ %s",
+					float64(batchSize)*float64(minDur)/float64(dur),
+					it.Key())
+				lastCommit = now
+				batchSize = 0
+				if err = tx.Commit(); err != nil {
+					return err
+				}
+				tx = nil
 			}
-			tx = nil
 		}
 	}
 	if tx != nil {
@@ -232,7 +244,7 @@ func (c *corpusDB) initDeletes(s sorted.KeyValue) (err error) {
 // index for the received blob br.
 func (c *corpusDB) AddBlob(ctx context.Context, br blob.Ref, mm *mutationMap) error {
 	var exists bool
-	if err := c.db.QueryRow(
+	if err := dbQueryRow(c.db,
 		`SELECT 1 FROM blobs_`+refPartition(br)+` WHERE ref = ?`,
 		br.String(),
 	).Scan(&exists); err == nil {
@@ -281,7 +293,7 @@ func (c *corpusDB) addKeyID(tx dbtx, signerBlobRef blob.Ref, signerID string) er
 		return nil
 	}
 	var existing string
-	err := tx.QueryRow(`SELECT keyid FROM signers WHERE signerref = ?`, signerBlobRef.String()).Scan(&existing)
+	err := dbQueryRow(tx, `SELECT keyid FROM signers WHERE signerref = ?`, signerBlobRef.String()).Scan(&existing)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		_, err = tx.Exec(`INSERT INTO signers (signerref, keyid) VALUES (?, ?)`, signerBlobRef.String(), signerID)
@@ -387,6 +399,7 @@ func (c *corpusDB) mergeClaimRow(db dbtx, k, v []byte) error {
 		); err != nil {
 			return err
 		}
+		c.claimsCache.Add(cl.Permanode.String(), nil)
 	}
 	_, err := db.Exec(
 		`INSERT OR REPLACE INTO claims_`+refPartition(cl.BlobRef)+`
@@ -572,7 +585,7 @@ func (c *corpusDB) IsDeleted(br blob.Ref) bool {
 }
 
 func (c *corpusDB) isDeleted(target string) bool {
-	rows, err := c.db.Query(`SELECT deleter FROM deletes WHERE deleted = ?`, target)
+	rows, err := dbQuery(c.db, `SELECT deleter FROM deletes WHERE deleted = ?`, target)
 	if err != nil {
 		return false
 	}
@@ -592,7 +605,7 @@ func (c *corpusDB) isDeleted(target string) bool {
 func (c *corpusDB) HasLegacySHA1() bool { return c.hasLegacySHA1 }
 
 func (c *corpusDB) SignerRefs(keyID string) SignerRefSet {
-	rows, err := c.db.Query(`SELECT signerref FROM signers WHERE keyid = ?`, keyID)
+	rows, err := dbQuery(c.db, `SELECT signerref FROM signers WHERE keyid = ?`, keyID)
 	if err != nil {
 		return nil
 	}
@@ -610,7 +623,7 @@ func (c *corpusDB) SignerRefs(keyID string) SignerRefSet {
 
 func (c *corpusDB) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 	var keyID string
-	err := c.db.QueryRow(`SELECT keyid FROM signers WHERE signerref = ?`, signer.String()).Scan(&keyID)
+	err := dbQueryRow(c.db, `SELECT keyid FROM signers WHERE signerref = ?`, signer.String()).Scan(&keyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", sorted.ErrNotFound
 	}
@@ -623,7 +636,7 @@ func (c *corpusDB) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 func (c *corpusDB) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
 	var size uint64
 	var camliType string
-	err := c.db.QueryRow(
+	err := dbQueryRow(c.db,
 		`SELECT size, camlitype FROM blobs_`+refPartition(br)+` WHERE ref = ?`,
 		br.String(),
 	).Scan(&size, &camliType)
@@ -658,7 +671,7 @@ func (c *corpusDB) fileInfo(fileRef blob.Ref) (camtypes.FileInfo, bool, error) {
 		wholeRef       string
 		timeN, modN    sql.NullInt64
 	)
-	err := c.db.QueryRow(`SELECT size, filename, mimetype, wholeref, time, modtime
+	err := dbQueryRow(c.db, `SELECT size, filename, mimetype, wholeref, time, modtime
 		FROM files WHERE fileref = ?`, fileRef.String()).
 		Scan(&size, &filename, &mime, &wholeRef, &timeN, &modN)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -689,7 +702,7 @@ func (c *corpusDB) fileInfo(fileRef blob.Ref) (camtypes.FileInfo, bool, error) {
 func (c *corpusDB) GetImageInfo(ctx context.Context, fileRef blob.Ref) (camtypes.ImageInfo, error) {
 	var ii camtypes.ImageInfo
 	var width, height uint64
-	err := c.db.QueryRow(`SELECT width, height FROM imagesizes WHERE fileref = ?`, fileRef.String()).
+	err := dbQueryRow(c.db, `SELECT width, height FROM imagesizes WHERE fileref = ?`, fileRef.String()).
 		Scan(&width, &height)
 	if errors.Is(err, sql.ErrNoRows) {
 		return camtypes.ImageInfo{}, os.ErrNotExist
@@ -707,7 +720,7 @@ func (c *corpusDB) GetMediaTags(ctx context.Context, fileRef blob.Ref) (map[stri
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	rows, err := c.db.Query(`SELECT tag, value FROM mediatags WHERE wholeref = ?`, wholeRef.String())
+	rows, err := dbQuery(c.db, `SELECT tag, value FROM mediatags WHERE wholeref = ?`, wholeRef.String())
 	if err != nil {
 		return nil, err
 	}
@@ -734,7 +747,7 @@ func (c *corpusDB) GetMediaTags(ctx context.Context, fileRef blob.Ref) (map[stri
 
 func (c *corpusDB) GetWholeRef(ctx context.Context, fileRef blob.Ref) (wholeRef blob.Ref, ok bool) {
 	var s string
-	err := c.db.QueryRow(`SELECT wholeref FROM wholetofile WHERE fileref = ?`, fileRef.String()).Scan(&s)
+	err := dbQueryRow(c.db, `SELECT wholeref FROM wholetofile WHERE fileref = ?`, fileRef.String()).Scan(&s)
 	if err != nil {
 		return blob.Ref{}, false
 	}
@@ -747,7 +760,7 @@ func (c *corpusDB) FileLatLong(fileRef blob.Ref) (lat, long float64, ok bool) {
 	if !ok {
 		return 0, 0, false
 	}
-	err := c.db.QueryRow(`SELECT lat, long FROM exifgps WHERE wholeref = ?`, wholeRef.String()).Scan(&lat, &long)
+	err := dbQueryRow(c.db, `SELECT lat, long FROM exifgps WHERE wholeref = ?`, wholeRef.String()).Scan(&lat, &long)
 	if err != nil {
 		return 0, 0, false
 	}
@@ -785,7 +798,7 @@ func (c *corpusDB) GetParentDirs(ctx context.Context, childRef blob.Ref) (map[bl
 }
 
 func (c *corpusDB) childRefs(query string, br blob.Ref) (map[blob.Ref]struct{}, error) {
-	rows, err := c.db.Query(query, br.String())
+	rows, err := dbQuery(c.db, query, br.String())
 	if err != nil {
 		return nil, err
 	}
@@ -805,59 +818,52 @@ func (c *corpusDB) childRefs(query string, br blob.Ref) (map[blob.Ref]struct{}, 
 }
 
 // claimsOf returns the claims of the permanode pn, sorted by date.
-func (c *corpusDB) claimsOf(pn blob.Ref) ([]*camtypes.Claim, error) {
-	rows, err := c.db.Query(
-		`SELECT claimref FROM claims_by_permanode_`+refPartition(pn)+` WHERE permanode = ?`,
-		pn.String())
-	if err != nil {
-		return nil, err
-	}
-	var claimRefs []string
-	for rows.Next() {
-		var claimRef string
-		if err := rows.Scan(&claimRef); err != nil {
-			rows.Close()
-			return nil, err
+func (c *corpusDB) claimsOf(pn blob.Ref) ([]camtypes.Claim, error) {
+	key := pn.String()
+	x, err := c.singleClaimsOf.Do(key, func() (any, error) {
+		if x, _ := c.claimsCache.Get(key); x != nil {
+			if claims, ok := x.([]camtypes.Claim); ok {
+				return claims, nil
+			}
 		}
-		claimRefs = append(claimRefs, claimRef)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	var claims []*camtypes.Claim
-	for _, claimRef := range claimRefs {
-		cr := blob.ParseOrZero(claimRef)
-		row := c.db.QueryRow(`SELECT claimref, signerref, permanode, date, type, attr, value
-			FROM claims_`+refPartition(cr)+` WHERE claimref = ?`, cr.String())
-		cl, err := scanClaim(row)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
+		rows, err := dbQuery(c.db,
+			`SELECT B.claimref, B.signerref, B.permanode, B.date, B.type, B.attr, B.value
+		FROM claims_by_permanode_`+refPartition(pn)+` A
+		INNER JOIN claims B ON B.claimref = A.claimref
+		WHERE A.permanode = ?`,
+			key)
 		if err != nil {
 			return nil, err
 		}
-		claims = append(claims, cl)
-	}
-	sort.Slice(claims, func(i, j int) bool { return claims[i].Date.Before(claims[j].Date) })
-	return claims, nil
+		var claims []camtypes.Claim
+		start := time.Now()
+		for rows.Next() {
+			cl, err := scanClaim(rows)
+			if err != nil {
+				return nil, err
+			}
+			claims = append(claims, cl)
+		}
+		if dur := time.Since(start); dur > time.Second {
+			log.Printf("claimsOf(%s): %d / %s", key, len(claims), dur)
+		}
+		sort.Slice(claims, func(i, j int) bool { return claims[i].Date.Before(claims[j].Date) })
+		c.claimsCache.Add(key, claims)
+		return claims, nil
+	})
+	return x.([]camtypes.Claim), err
 }
 
-// rowScanner is implemented by both *sql.Row and *sql.Rows.
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanClaim(row rowScanner) (*camtypes.Claim, error) {
+func scanClaim(row interface{ Scan(dest ...any) error }) (camtypes.Claim, error) {
 	var (
 		claimRef, signerRef, permanode string
 		dateN                          int64
 		typ, attr, value               string
 	)
 	if err := row.Scan(&claimRef, &signerRef, &permanode, &dateN, &typ, &attr, &value); err != nil {
-		return nil, err
+		return camtypes.Claim{}, err
 	}
-	return &camtypes.Claim{
+	return camtypes.Claim{
 		BlobRef:   blob.ParseOrZero(claimRef),
 		Signer:    blob.ParseOrZero(signerRef),
 		Permanode: blob.ParseOrZero(permanode),
@@ -892,7 +898,7 @@ func (c *corpusDB) AppendClaims(ctx context.Context, dst []camtypes.Claim, perma
 		if attrFilter != "" && cl.Attr != attrFilter {
 			continue
 		}
-		dst = append(dst, *cl)
+		dst = append(dst, cl)
 	}
 	return dst, nil
 }
@@ -921,7 +927,7 @@ func (c *corpusDB) AppendPermanodeAttrValues(dst []string,
 
 // replayAttrValues computes the values of attr from the (date-sorted)
 // claims at time at, for the given signerRefs filter.
-func replayAttrValues(claims []*camtypes.Claim, attr string, at time.Time, signerRefs SignerRefSet, dst []string) []string {
+func replayAttrValues(claims []camtypes.Claim, attr string, at time.Time, signerRefs SignerRefSet, dst []string) []string {
 	if at.IsZero() {
 		at = time.Now()
 	}
@@ -953,10 +959,7 @@ func replayAttrValues(claims []*camtypes.Claim, attr string, at time.Time, signe
 	return dst
 }
 
-func (c *corpusDB) PermanodeAttrValue(permaNode blob.Ref,
-	attr string,
-	at time.Time,
-	signerFilter string) string {
+func (c *corpusDB) PermanodeAttrValue(permaNode blob.Ref, attr string, at time.Time, signerFilter string) string {
 	values := c.AppendPermanodeAttrValues(nil, permaNode, attr, at, signerFilter)
 	if len(values) == 0 {
 		return ""
@@ -1005,14 +1008,14 @@ func (c *corpusDB) ForeachClaim(permaNode blob.Ref, at time.Time, fn func(*camty
 		if !at.IsZero() && cl.Date.After(at) {
 			continue
 		}
-		if !fn(cl) {
+		if !fn(&cl) {
 			return
 		}
 	}
 }
 
 func (c *corpusDB) ForeachClaimBack(value blob.Ref, at time.Time, fn func(*camtypes.Claim) bool) {
-	rows, err := c.db.Query(
+	rows, err := dbQuery(c.db,
 		`SELECT claimref, signerref, permanode, date, type, attr, value
 		FROM claims WHERE value = ? ORDER BY date, claimref`,
 		value.String())
@@ -1028,7 +1031,7 @@ func (c *corpusDB) ForeachClaimBack(value blob.Ref, at time.Time, fn func(*camty
 		if !at.IsZero() && cl.Date.After(at) {
 			continue
 		}
-		if !fn(cl) {
+		if !fn(&cl) {
 			return
 		}
 	}
@@ -1129,9 +1132,13 @@ func (c *corpusDB) PermanodeAnyTime(pn blob.Ref) (t time.Time, ok bool) {
 
 func (c *corpusDB) PermanodeAttrsOrClaims(permaNode blob.Ref,
 	at time.Time, signerID string) (m map[string][]string, claims []*camtypes.Claim) {
-	claims, err := c.claimsOf(permaNode)
-	if err != nil || len(claims) == 0 {
+	claimsRaw, err := c.claimsOf(permaNode)
+	if err != nil || len(claimsRaw) == 0 {
 		return nil, nil
+	}
+	claims = make([]*camtypes.Claim, len(claimsRaw))
+	for i := range claimsRaw {
+		claims[i] = &claimsRaw[i]
 	}
 	if !at.IsZero() && claims[len(claims)-1].Date.After(at) {
 		return nil, claims
@@ -1177,7 +1184,7 @@ func (c *corpusDB) PermanodeAttrsOrClaims(permaNode blob.Ref,
 
 func (c *corpusDB) listPermanodes(pnTime func(blob.Ref) (time.Time, bool), reverse bool) ([]pnAndTime, error) {
 	var pns []pnAndTime
-	rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims_by_permanode`)
+	rows, err := dbQuery(c.db, `SELECT DISTINCT permanode FROM claims_by_permanode`)
 	if err != nil {
 		return nil, err
 	}
@@ -1236,7 +1243,7 @@ func (c *corpusDB) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, n
 
 func (c *corpusDB) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool, camliNodeTypes []string) {
 	for _, typ := range camliNodeTypes {
-		rows, err := c.db.Query(
+		rows, err := dbQuery(c.db,
 			`SELECT DISTINCT permanode FROM claims WHERE attr = 'camliNodeType' AND permanode IS NOT NULL AND value = ?`,
 			typ)
 		if err != nil {
@@ -1266,7 +1273,7 @@ func (c *corpusDB) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
 }
 
 func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool, args ...any) {
-	rows, err := c.db.Query(query, args...)
+	rows, err := dbQuery(c.db, query, args...)
 	if err != nil {
 		return
 	}
@@ -1308,7 +1315,7 @@ func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.
 
 func (c *corpusDB) IterPermanodes() iter.Seq[blob.Ref] {
 	return func(yield func(blob.Ref) bool) {
-		rows, err := c.db.Query(`SELECT DISTINCT permanode FROM claims_by_permanode`)
+		rows, err := dbQuery(c.db, `SELECT DISTINCT permanode FROM claims_by_permanode`)
 		if err != nil {
 			panic(err)
 		}
@@ -1431,4 +1438,33 @@ func signerRefsMatch(refs SignerRefSet, br blob.Ref) bool {
 
 func refPartition(br blob.Ref) string {
 	return fmt.Sprintf(partPat, br.Sum32()%partNum)
+}
+
+func dbQuery(
+	db interface {
+		Query(string, ...any) (*sql.Rows, error)
+	},
+	qry string, args ...any,
+) (*sql.Rows, error) {
+	start := time.Now()
+	rows, err := db.Query(qry, args...)
+	if err != nil {
+		log.Printf("%s: %+v", qry, err)
+		return rows, err
+	}
+	if dur := time.Since(start); dur > time.Second {
+		log.Printf("%s: %s", qry, time.Since(start))
+	}
+	return rows, nil
+}
+func dbQueryRow(
+	db interface{ QueryRow(string, ...any) *sql.Row },
+	qry string, args ...any,
+) *sql.Row {
+	start := time.Now()
+	row := db.QueryRow(qry, args...)
+	if dur := time.Since(start); dur > time.Second {
+		log.Printf("%s: %s", qry, time.Since(start))
+	}
+	return row
 }

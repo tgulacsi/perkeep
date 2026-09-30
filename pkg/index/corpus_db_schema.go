@@ -38,6 +38,7 @@ const (
 // implemented by both *sql.DB and *sql.Tx.
 type dbtx interface {
 	Exec(query string, args ...any) (sql.Result, error)
+	Query(string, ...any) (*sql.Rows, error)
 	QueryRow(query string, args ...any) *sql.Row
 }
 
@@ -51,7 +52,7 @@ func openDB(file string) (*sql.DB, error) {
 	for _, s := range []string{
 		"journal_mode = WAL",
 		"synchronous = OFF",
-		"cache_size = -40000",
+		"cache_size = -80000",
 		"page_size = 16384",
 		"optimize",
 	} {
