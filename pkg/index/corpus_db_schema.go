@@ -51,8 +51,8 @@ func openDB(file string) (*sql.DB, error) {
 	}
 	for _, s := range []string{
 		"journal_mode = WAL",
-		"synchronous = OFF",
-		"cache_size = -80000",
+		"synchronous = NORMAL",
+		"cache_size = -160000",
 		"page_size = 16384",
 		"optimize",
 	} {

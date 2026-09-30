@@ -90,7 +90,7 @@ func NewCorpusDB(file string) (*corpusDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &corpusDB{db: db, claimsCache: lru.New(1000), singleClaimsOf: new(singleflight.Group)}
+	c := &corpusDB{db: db, claimsCache: lru.New(1024), singleClaimsOf: new(singleflight.Group)}
 	rows, err := dbQuery(db, `SELECT metakey, value FROM meta`)
 	if err != nil {
 		db.Close()
@@ -211,6 +211,8 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 	if tx != nil {
 		return tx.Commit()
 	}
+	c.db.Exec("VACUUM")
+	c.db.Exec("PRAGMA WAL_CHECKPOINT(TRUNCATE)")
 	return nil
 }
 
@@ -826,28 +828,73 @@ func (c *corpusDB) claimsOf(pn blob.Ref) ([]camtypes.Claim, error) {
 				return claims, nil
 			}
 		}
-		rows, err := dbQuery(c.db,
-			`SELECT B.claimref, B.signerref, B.permanode, B.date, B.type, B.attr, B.value
-		FROM claims_by_permanode_`+refPartition(pn)+` A
-		INNER JOIN claims B ON B.claimref = A.claimref
-		WHERE A.permanode = ?`,
-			key)
+		var claims []camtypes.Claim
+		start := time.Now()
+		// This hand-rolled join is faster than
+		//
+		// 		`SELECT B.claimref, B.signerref, B.permanode, B.date, B.type, B.attr, B.value
+		// FROM claims_by_permanode_`+refPartition(pn)+` A
+		// INNER JOIN claims B ON B.claimref = A.claimref
+		// WHERE A.permanode = ?
+		// ORDER BY B.date`,
+		tx, err := c.db.Begin()
 		if err != nil {
 			return nil, err
 		}
-		var claims []camtypes.Claim
-		start := time.Now()
+		defer tx.Rollback()
+		rows, err := dbQuery(tx, "SELECT claimref FROM claims_by_permanode_"+refPartition(pn)+" WHERE permanode = ?", key)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		crs := make(map[string][]any)
 		for rows.Next() {
-			cl, err := scanClaim(rows)
-			if err != nil {
+			var s string
+			if err = rows.Scan(&s); err != nil {
+				rows.Close()
 				return nil, err
 			}
-			claims = append(claims, cl)
+			cr := blob.ParseOrZero(s)
+			part := refPartition(cr)
+			crs[part] = append(crs[part], cr.String())
 		}
-		if dur := time.Since(start); dur > time.Second {
+		if err = rows.Close(); err != nil {
+			return nil, err
+		}
+		var buf strings.Builder
+		for part, crs := range crs {
+			buf.Reset()
+			buf.WriteString(`SELECT claimref, signerref, permanode, date, type, attr, value
+		FROM claims_`)
+			buf.WriteString(part)
+			buf.WriteString(" WHERE claimref IN (")
+			for i := range crs {
+				if i != 0 {
+					buf.WriteString(", ")
+				}
+				buf.WriteString("?")
+			}
+			buf.WriteString(") ORDER BY date")
+			// fmt.Println(buf.String(), crs)
+			rows, err := dbQuery(tx, buf.String(), crs...)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", buf.String(), err)
+			}
+			for rows.Next() {
+				cl, err := scanClaim(rows)
+				if err != nil {
+					rows.Close()
+					return claims, err
+				}
+				claims = append(claims, cl)
+			}
+			if err = rows.Close(); err != nil {
+				return claims, err
+			}
+		}
+		if dur := time.Since(start); len(claims) == 0 || dur/time.Duration(len(claims)) > 2*time.Millisecond {
 			log.Printf("claimsOf(%s): %d / %s", key, len(claims), dur)
 		}
-		sort.Slice(claims, func(i, j int) bool { return claims[i].Date.Before(claims[j].Date) })
 		c.claimsCache.Add(key, claims)
 		return claims, nil
 	})
@@ -907,7 +954,8 @@ func (c *corpusDB) AppendPermanodeAttrValues(dst []string,
 	permaNode blob.Ref,
 	attr string,
 	at time.Time,
-	signerFilter string) []string {
+	signerFilter string,
+) []string {
 	if len(dst) > 0 {
 		panic("len(dst) must be 0")
 	}
