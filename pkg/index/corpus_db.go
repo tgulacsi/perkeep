@@ -63,7 +63,7 @@ func NewDBCorpusFromStorage(file string, s sorted.KeyValue) (*corpusDB, error) {
 // A corpusDB is safe for concurrent use, as long as AddBlob is not invoked
 // concurrently for the same blob.
 type corpusDB struct {
-	db             *sql.DB
+	db             *sql.Conn
 	claimsCache    *lru.Cache
 	singleClaimsOf *singleflight.Group
 
@@ -90,8 +90,10 @@ func NewCorpusDB(file string) (*corpusDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &corpusDB{db: db, claimsCache: lru.New(1024), singleClaimsOf: new(singleflight.Group)}
-	rows, err := dbQuery(db, `SELECT metakey, value FROM meta`)
+	c := &corpusDB{db: db, claimsCache: lru.New(16 << 10), singleClaimsOf: new(singleflight.Group)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rows, err := dbQuery(ctx, db, `SELECT metakey, value FROM meta`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -157,18 +159,20 @@ func (c *corpusDB) ScanFromStorage(s sorted.KeyValue) error {
 	c.building = true
 	defer func() { c.building = false }()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for _, prefix := range scanPrefixes {
-		if err := c.scanPrefix(s, prefix); err != nil {
+		if err := c.scanPrefix(ctx, s, prefix); err != nil {
 			return err
 		}
 	}
-	if err := c.initDeletes(s); err != nil {
+	if err := c.initDeletes(ctx, s); err != nil {
 		return fmt.Errorf("Could not populate the corpus deletes: %w", err)
 	}
 	return nil
 }
 
-func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
+func (c *corpusDB) scanPrefix(ctx context.Context, s sorted.KeyValue, prefix string) (err error) {
 	if os.Getenv("SKIP_SCAN_PREFIX") == "1" {
 		return nil
 	}
@@ -184,11 +188,11 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 	lastCommit := time.Now()
 	for it.Next() {
 		if tx == nil {
-			if tx, err = c.db.Begin(); err != nil {
+			if tx, err = c.db.BeginTx(ctx, nil); err != nil {
 				return err
 			}
 		}
-		if err := c.mergeRow(tx, []byte(it.Key()), []byte(it.Value())); err != nil {
+		if err := c.mergeRow(ctx, tx, []byte(it.Key()), []byte(it.Value())); err != nil {
 			return err
 		}
 		batchSize++
@@ -211,8 +215,8 @@ func (c *corpusDB) scanPrefix(s sorted.KeyValue, prefix string) (err error) {
 	if tx != nil {
 		return tx.Commit()
 	}
-	c.db.Exec("VACUUM")
-	c.db.Exec("PRAGMA WAL_CHECKPOINT(TRUNCATE)")
+	c.db.ExecContext(ctx, "VACUUM")
+	c.db.ExecContext(ctx, "PRAGMA WAL_CHECKPOINT(TRUNCATE)")
 	return nil
 }
 
@@ -226,7 +230,7 @@ func prefixEnd(prefix string) string {
 }
 
 // initDeletes populates the corpus deletes from the "deleted" rows in s.
-func (c *corpusDB) initDeletes(s sorted.KeyValue) (err error) {
+func (c *corpusDB) initDeletes(ctx context.Context, s sorted.KeyValue) (err error) {
 	it := s.Find("deleted|", prefixEnd("deleted|"))
 	defer closeIterator(it, &err)
 	for it.Next() {
@@ -234,7 +238,7 @@ func (c *corpusDB) initDeletes(s sorted.KeyValue) (err error) {
 		if !ok {
 			return fmt.Errorf("Bogus keyDeleted entry key: want |\"deleted\"|<deleted blobref>|<reverse claimdate>|<deleter claim>|, got %q", it.Key())
 		}
-		if _, err := c.db.Exec(`INSERT OR IGNORE INTO deletes (deleted, deleter, deltime) VALUES (?, ?, ?)`,
+		if _, err := c.db.ExecContext(ctx, `INSERT OR IGNORE INTO deletes (deleted, deleter, deltime) VALUES (?, ?, ?)`,
 			cl.Target.String(), cl.BlobRef.String(), cl.Date.UnixNano()); err != nil {
 			return err
 		}
@@ -246,7 +250,7 @@ func (c *corpusDB) initDeletes(s sorted.KeyValue) (err error) {
 // index for the received blob br.
 func (c *corpusDB) AddBlob(ctx context.Context, br blob.Ref, mm *mutationMap) error {
 	var exists bool
-	if err := dbQueryRow(c.db,
+	if err := dbQueryRow(ctx, c.db,
 		`SELECT 1 FROM blobs_`+refPartition(br)+` WHERE ref = ?`,
 		br.String(),
 	).Scan(&exists); err == nil {
@@ -268,7 +272,7 @@ func (c *corpusDB) AddBlob(ctx context.Context, br blob.Ref, mm *mutationMap) er
 	// blobRef-signerID relation needs to be known before the claim
 	// mutations themselves.
 	if signerRef := mm.SignerBlobRef(); mm.SignerID() != "" && signerRef.Valid() {
-		if err := c.addKeyID(tx, signerRef, mm.SignerID()); err != nil {
+		if err := c.addKeyID(ctx, tx, signerRef, mm.SignerID()); err != nil {
 			return err
 		}
 	}
@@ -277,12 +281,12 @@ func (c *corpusDB) AddBlob(ctx context.Context, br blob.Ref, mm *mutationMap) er
 			// because we already took care of it in addKeyID.
 			continue
 		}
-		if err := c.mergeRow(tx, []byte(k), []byte(v)); err != nil {
+		if err := c.mergeRow(ctx, tx, []byte(k), []byte(v)); err != nil {
 			return err
 		}
 	}
 	for _, cl := range mm.Deletes() {
-		if err := c.updateDeletes(tx, cl); err != nil {
+		if err := c.updateDeletes(ctx, tx, cl); err != nil {
 			return fmt.Errorf("Could not update the deletes cache after deletion from %v: %w", cl, err)
 		}
 	}
@@ -290,15 +294,15 @@ func (c *corpusDB) AddBlob(ctx context.Context, br blob.Ref, mm *mutationMap) er
 	return tx.Commit()
 }
 
-func (c *corpusDB) addKeyID(tx dbtx, signerBlobRef blob.Ref, signerID string) error {
+func (c *corpusDB) addKeyID(ctx context.Context, tx dbtx, signerBlobRef blob.Ref, signerID string) error {
 	if signerID == "" || !signerBlobRef.Valid() {
 		return nil
 	}
 	var existing string
-	err := dbQueryRow(tx, `SELECT keyid FROM signers WHERE signerref = ?`, signerBlobRef.String()).Scan(&existing)
+	err := dbQueryRow(ctx, tx, `SELECT keyid FROM signers WHERE signerref = ?`, signerBlobRef.String()).Scan(&existing)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		_, err = tx.Exec(`INSERT INTO signers (signerref, keyid) VALUES (?, ?)`, signerBlobRef.String(), signerID)
+		_, err = tx.ExecContext(ctx, `INSERT INTO signers (signerref, keyid) VALUES (?, ?)`, signerBlobRef.String(), signerID)
 		return err
 	case err != nil:
 		return err
@@ -311,41 +315,41 @@ func (c *corpusDB) addKeyID(tx dbtx, signerBlobRef blob.Ref, signerID string) er
 
 // updateDeletes updates the corpus deletes with the delete claim
 // deleteClaim, which is trusted to be a valid delete Claim.
-func (c *corpusDB) updateDeletes(tx dbtx, deleteClaim schema.Claim) error {
+func (c *corpusDB) updateDeletes(ctx context.Context, tx dbtx, deleteClaim schema.Claim) error {
 	target := deleteClaim.Target()
 	deleter := deleteClaim.Blob()
 	when, err := deleter.ClaimDate()
 	if err != nil {
 		return fmt.Errorf("Could not get date of delete claim %v: %w", deleteClaim, err)
 	}
-	_, err = tx.Exec(`INSERT OR IGNORE INTO deletes (deleted, deleter, deltime) VALUES (?, ?, ?)`,
+	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deletes (deleted, deleter, deltime) VALUES (?, ?, ?)`,
 		target.String(), deleter.BlobRef().String(), when.UnixNano())
 	return err
 }
 
 // mergeRow applies one index row (k, v) to the corpus.
-func (c *corpusDB) mergeRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeRow(ctx context.Context, db dbtx, k, v []byte) error {
 	switch {
 	case bytes.HasPrefix(k, []byte("meta:")):
-		return c.mergeMetaRow(db, k, v)
+		return c.mergeMetaRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte(keySignerKeyIDName+":")):
-		return c.mergeSignerKeyIDRow(db, k, v)
+		return c.mergeSignerKeyIDRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("claim|")):
-		return c.mergeClaimRow(db, k, v)
+		return c.mergeClaimRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("fileinfo|")):
-		return c.mergeFileInfoRow(db, k, v)
+		return c.mergeFileInfoRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("filetimes|")):
-		return c.mergeFileTimesRow(db, k, v)
+		return c.mergeFileTimesRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("imagesize|")):
-		return c.mergeImageSizeRow(db, k, v)
+		return c.mergeImageSizeRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("wholetofile|")):
-		return c.mergeWholeToFileRow(db, k, v)
+		return c.mergeWholeToFileRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("exifgps|")):
-		return c.mergeEXIFGPSRow(db, k, v)
+		return c.mergeEXIFGPSRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("mediatag|")):
-		return c.mergeMediaTagRow(db, k, v)
+		return c.mergeMediaTagRow(ctx, db, k, v)
 	case bytes.HasPrefix(k, []byte("dirchild|")):
-		return c.mergeStaticDirChildRow(db, k, v)
+		return c.mergeStaticDirChildRow(ctx, db, k, v)
 	default:
 		// "have", "recpn", "signerattrvalue", and "exiftag" rows are not
 		// represented in the corpus.
@@ -353,7 +357,7 @@ func (c *corpusDB) mergeRow(db dbtx, k, v []byte) error {
 	}
 }
 
-func (c *corpusDB) mergeMetaRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeMetaRow(ctx context.Context, db dbtx, k, v []byte) error {
 	// "meta:<ref>" -> "<size>|<mime>"
 	br, ok := blob.ParseBytes(k[len("meta:"):])
 	if !ok {
@@ -367,7 +371,7 @@ func (c *corpusDB) mergeMetaRow(db dbtx, k, v []byte) error {
 	if err != nil {
 		return fmt.Errorf("bogus meta row: %q -> %q", k, v)
 	}
-	if _, err = db.Exec(
+	if _, err = db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO blobs_`+refPartition(br)+` (ref, size, camlitype) VALUES (?, ?, ?)`,
 		br.String(), size, string(camliTypeFromMIME(string(v[pipe+1:]))),
 	); err != nil {
@@ -379,21 +383,21 @@ func (c *corpusDB) mergeMetaRow(db dbtx, k, v []byte) error {
 	return nil
 }
 
-func (c *corpusDB) mergeSignerKeyIDRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeSignerKeyIDRow(ctx context.Context, db dbtx, k, v []byte) error {
 	br, ok := blob.ParseBytes(k[len(keySignerKeyIDName+":"):])
 	if !ok {
 		return fmt.Errorf("bogus signerid row: %q -> %q", k, v)
 	}
-	return c.addKeyID(db, br, string(v))
+	return c.addKeyID(ctx, db, br, string(v))
 }
 
-func (c *corpusDB) mergeClaimRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeClaimRow(ctx context.Context, db dbtx, k, v []byte) error {
 	cl, ok := parseClaimBytes(k, v)
 	if !ok || !cl.Permanode.Valid() {
 		return fmt.Errorf("bogus claim row: %q -> %q", k, v)
 	}
 	if cl.Permanode.Valid() {
-		if _, err := db.Exec(
+		if _, err := db.ExecContext(ctx,
 			`INSERT OR REPLACE INTO claims_by_permanode_`+refPartition(cl.Permanode)+`
 		(permanode, claimref)
 		VALUES (?, ?)`,
@@ -403,7 +407,7 @@ func (c *corpusDB) mergeClaimRow(db dbtx, k, v []byte) error {
 		}
 		c.claimsCache.Add(cl.Permanode.String(), nil)
 	}
-	_, err := db.Exec(
+	_, err := db.ExecContext(ctx,
 		`INSERT OR REPLACE INTO claims_`+refPartition(cl.BlobRef)+`
 		(claimref, permanode, signerref, date, type, attr, value)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -412,7 +416,7 @@ func (c *corpusDB) mergeClaimRow(db dbtx, k, v []byte) error {
 	return err
 }
 
-func (c *corpusDB) mergeFileInfoRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeFileInfoRow(ctx context.Context, db dbtx, k, v []byte) error {
 	// "fileinfo|<fileref>" -> "<size>|<filename>|<mimetype>[|<wholeref>]"
 	pipe := bytes.IndexByte(k, '|')
 	if pipe < 0 {
@@ -438,7 +442,7 @@ func (c *corpusDB) mergeFileInfoRow(db dbtx, k, v []byte) error {
 		}
 		wholeRef = wr.String()
 	}
-	_, err = db.Exec(`INSERT INTO files (fileref, size, filename, mimetype, wholeref)
+	_, err = db.ExecContext(ctx, `INSERT INTO files (fileref, size, filename, mimetype, wholeref)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(fileref) DO UPDATE SET
 			size = excluded.size,
@@ -449,7 +453,7 @@ func (c *corpusDB) mergeFileInfoRow(db dbtx, k, v []byte) error {
 	return err
 }
 
-func (c *corpusDB) mergeFileTimesRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeFileTimesRow(ctx context.Context, db dbtx, k, v []byte) error {
 	if len(v) == 0 {
 		return nil
 	}
@@ -463,15 +467,15 @@ func (c *corpusDB) mergeFileTimesRow(db dbtx, k, v []byte) error {
 		return fmt.Errorf("unexpected filetimes blobref in key %q", k)
 	}
 	times := strings.Split(urld(string(v)), ",")
-	if _, err := db.Exec(`INSERT OR IGNORE INTO files (fileref) VALUES (?)`, br.String()); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO files (fileref) VALUES (?)`, br.String()); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`UPDATE files SET time = ? WHERE fileref = ?`,
+	if _, err := db.ExecContext(ctx, `UPDATE files SET time = ? WHERE fileref = ?`,
 		time3339OrNilNanos(times[0]), br.String()); err != nil {
 		return err
 	}
 	if len(times) == 2 {
-		if _, err := db.Exec(`UPDATE files SET modtime = ? WHERE fileref = ?`,
+		if _, err := db.ExecContext(ctx, `UPDATE files SET modtime = ? WHERE fileref = ?`,
 			time3339OrNilNanos(times[1]), br.String()); err != nil {
 			return err
 		}
@@ -479,19 +483,19 @@ func (c *corpusDB) mergeFileTimesRow(db dbtx, k, v []byte) error {
 	return nil
 }
 
-func (c *corpusDB) mergeImageSizeRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeImageSizeRow(ctx context.Context, db dbtx, k, v []byte) error {
 	br, okk := blob.ParseBytes(k[len("imagesize|"):])
 	ii, okv := parseImageInfo(v)
 	if !okk || !okv {
 		return fmt.Errorf("bogus row %q = %q", k, v)
 	}
-	_, err := db.Exec(`INSERT INTO imagesizes (fileref, width, height) VALUES (?, ?, ?)
+	_, err := db.ExecContext(ctx, `INSERT INTO imagesizes (fileref, width, height) VALUES (?, ?, ?)
 		ON CONFLICT(fileref) DO UPDATE SET width = excluded.width, height = excluded.height`,
 		br.String(), ii.Width, ii.Height)
 	return err
 }
 
-func (c *corpusDB) mergeWholeToFileRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeWholeToFileRow(ctx context.Context, db dbtx, k, v []byte) error {
 	// "wholetofile|<wholeref>|<fileref>" -> "1"
 	pair := k[len("wholetofile|"):]
 	pipe := bytes.IndexByte(pair, '|')
@@ -503,14 +507,14 @@ func (c *corpusDB) mergeWholeToFileRow(db dbtx, k, v []byte) error {
 	if !ok1 || !ok2 {
 		return fmt.Errorf("bogus row %q = %q", k, v)
 	}
-	if _, err := db.Exec(`INSERT INTO wholetofile (fileref, wholeref) VALUES (?, ?)
+	if _, err := db.ExecContext(ctx, `INSERT INTO wholetofile (fileref, wholeref) VALUES (?, ?)
 		ON CONFLICT(fileref) DO UPDATE SET wholeref = excluded.wholeref`,
 		fileRef.String(), wholeRef.String()); err != nil {
 		return err
 	}
 	if c.building && !c.hasLegacySHA1 && bytes.HasPrefix(pair, sha1Prefix) {
 		c.hasLegacySHA1 = true
-		if _, err := db.Exec(`INSERT OR REPLACE INTO meta (metakey, value) VALUES (?, ?)`,
+		if _, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO meta (metakey, value) VALUES (?, ?)`,
 			metaHasLegacySHA1, valHasLegacySHA1); err != nil {
 			return err
 		}
@@ -518,7 +522,7 @@ func (c *corpusDB) mergeWholeToFileRow(db dbtx, k, v []byte) error {
 	return nil
 }
 
-func (c *corpusDB) mergeEXIFGPSRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeEXIFGPSRow(ctx context.Context, db dbtx, k, v []byte) error {
 	// "exifgps|<wholeref>" -> "<lat>|<long>"
 	wholeRef, ok := blob.ParseBytes(k[len("exifgps|"):])
 	pipe := bytes.IndexByte(v, '|')
@@ -535,12 +539,12 @@ func (c *corpusDB) mergeEXIFGPSRow(db dbtx, k, v []byte) error {
 		}
 		return nil
 	}
-	_, err := db.Exec(`INSERT OR REPLACE INTO exifgps (wholeref, lat, long) VALUES (?, ?, ?)`,
+	_, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO exifgps (wholeref, lat, long) VALUES (?, ?, ?)`,
 		wholeRef.String(), lat, long)
 	return err
 }
 
-func (c *corpusDB) mergeMediaTagRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeMediaTagRow(ctx context.Context, db dbtx, k, v []byte) error {
 	// "mediatag|<wholeref>|<tag>" -> "<value>"
 	f := strings.Split(string(k), "|")
 	if len(f) != 3 {
@@ -550,13 +554,13 @@ func (c *corpusDB) mergeMediaTagRow(db dbtx, k, v []byte) error {
 	if !ok {
 		return fmt.Errorf("failed to parse wholeref from key %q", k)
 	}
-	_, err := db.Exec(`INSERT INTO mediatags (wholeref, tag, value) VALUES (?, ?, ?)
+	_, err := db.ExecContext(ctx, `INSERT INTO mediatags (wholeref, tag, value) VALUES (?, ?, ?)
 		ON CONFLICT(wholeref, tag) DO UPDATE SET value = excluded.value`,
 		wholeRef.String(), f[2], urld(string(v)))
 	return err
 }
 
-func (c *corpusDB) mergeStaticDirChildRow(db dbtx, k, v []byte) error {
+func (c *corpusDB) mergeStaticDirChildRow(ctx context.Context, db dbtx, k, v []byte) error {
 	// "dirchild|<parent>|<child>" -> "1"
 	sk := k[len("dirchild|"):]
 	pipe := bytes.IndexByte(sk, '|')
@@ -571,11 +575,11 @@ func (c *corpusDB) mergeStaticDirChildRow(db dbtx, k, v []byte) error {
 	if !ok {
 		return fmt.Errorf("invalid dirchild child blobref in key %q", k)
 	}
-	if _, err := db.Exec(`INSERT OR IGNORE INTO dirchildren (parent, child) VALUES (?, ?)`,
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO dirchildren (parent, child) VALUES (?, ?)`,
 		parent.String(), child.String()); err != nil {
 		return err
 	}
-	_, err := db.Exec(`INSERT OR IGNORE INTO fileparents (child, parent) VALUES (?, ?)`,
+	_, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO fileparents (child, parent) VALUES (?, ?)`,
 		child.String(), parent.String())
 	return err
 }
@@ -583,11 +587,11 @@ func (c *corpusDB) mergeStaticDirChildRow(db dbtx, k, v []byte) error {
 // *********** Reading from the corpus
 
 func (c *corpusDB) IsDeleted(br blob.Ref) bool {
-	return c.isDeleted(br.String())
+	return c.isDeleted(context.Background(), br.String())
 }
 
-func (c *corpusDB) isDeleted(target string) bool {
-	rows, err := dbQuery(c.db, `SELECT deleter FROM deletes WHERE deleted = ?`, target)
+func (c *corpusDB) isDeleted(ctx context.Context, target string) bool {
+	rows, err := dbQuery(ctx, c.db, `SELECT deleter FROM deletes WHERE deleted = ?`, target)
 	if err != nil {
 		return false
 	}
@@ -597,7 +601,7 @@ func (c *corpusDB) isDeleted(target string) bool {
 		if err := rows.Scan(&deleter); err != nil {
 			continue
 		}
-		if !c.isDeleted(deleter) {
+		if !c.isDeleted(ctx, deleter) {
 			return true
 		}
 	}
@@ -607,7 +611,9 @@ func (c *corpusDB) isDeleted(target string) bool {
 func (c *corpusDB) HasLegacySHA1() bool { return c.hasLegacySHA1 }
 
 func (c *corpusDB) SignerRefs(keyID string) SignerRefSet {
-	rows, err := dbQuery(c.db, `SELECT signerref FROM signers WHERE keyid = ?`, keyID)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rows, err := dbQuery(ctx, c.db, `SELECT signerref FROM signers WHERE keyid = ?`, keyID)
 	if err != nil {
 		return nil
 	}
@@ -625,7 +631,7 @@ func (c *corpusDB) SignerRefs(keyID string) SignerRefSet {
 
 func (c *corpusDB) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 	var keyID string
-	err := dbQueryRow(c.db, `SELECT keyid FROM signers WHERE signerref = ?`, signer.String()).Scan(&keyID)
+	err := dbQueryRow(ctx, c.db, `SELECT keyid FROM signers WHERE signerref = ?`, signer.String()).Scan(&keyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", sorted.ErrNotFound
 	}
@@ -638,7 +644,7 @@ func (c *corpusDB) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
 func (c *corpusDB) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMeta, error) {
 	var size uint64
 	var camliType string
-	err := dbQueryRow(c.db,
+	err := dbQueryRow(ctx, c.db,
 		`SELECT size, camlitype FROM blobs_`+refPartition(br)+` WHERE ref = ?`,
 		br.String(),
 	).Scan(&size, &camliType)
@@ -656,7 +662,9 @@ func (c *corpusDB) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobM
 }
 
 func (c *corpusDB) GetFileInfo(ctx context.Context, fileRef blob.Ref) (camtypes.FileInfo, error) {
-	fi, ok, err := c.fileInfo(fileRef)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fi, ok, err := c.fileInfo(ctx, fileRef)
 	if err != nil {
 		return camtypes.FileInfo{}, err
 	}
@@ -666,14 +674,14 @@ func (c *corpusDB) GetFileInfo(ctx context.Context, fileRef blob.Ref) (camtypes.
 	return fi, nil
 }
 
-func (c *corpusDB) fileInfo(fileRef blob.Ref) (camtypes.FileInfo, bool, error) {
+func (c *corpusDB) fileInfo(ctx context.Context, fileRef blob.Ref) (camtypes.FileInfo, bool, error) {
 	var (
 		size           int64
 		filename, mime string
 		wholeRef       string
 		timeN, modN    sql.NullInt64
 	)
-	err := dbQueryRow(c.db, `SELECT size, filename, mimetype, wholeref, time, modtime
+	err := dbQueryRow(ctx, c.db, `SELECT size, filename, mimetype, wholeref, time, modtime
 		FROM files WHERE fileref = ?`, fileRef.String()).
 		Scan(&size, &filename, &mime, &wholeRef, &timeN, &modN)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -704,7 +712,7 @@ func (c *corpusDB) fileInfo(fileRef blob.Ref) (camtypes.FileInfo, bool, error) {
 func (c *corpusDB) GetImageInfo(ctx context.Context, fileRef blob.Ref) (camtypes.ImageInfo, error) {
 	var ii camtypes.ImageInfo
 	var width, height uint64
-	err := dbQueryRow(c.db, `SELECT width, height FROM imagesizes WHERE fileref = ?`, fileRef.String()).
+	err := dbQueryRow(ctx, c.db, `SELECT width, height FROM imagesizes WHERE fileref = ?`, fileRef.String()).
 		Scan(&width, &height)
 	if errors.Is(err, sql.ErrNoRows) {
 		return camtypes.ImageInfo{}, os.ErrNotExist
@@ -722,7 +730,7 @@ func (c *corpusDB) GetMediaTags(ctx context.Context, fileRef blob.Ref) (map[stri
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	rows, err := dbQuery(c.db, `SELECT tag, value FROM mediatags WHERE wholeref = ?`, wholeRef.String())
+	rows, err := dbQuery(ctx, c.db, `SELECT tag, value FROM mediatags WHERE wholeref = ?`, wholeRef.String())
 	if err != nil {
 		return nil, err
 	}
@@ -749,7 +757,7 @@ func (c *corpusDB) GetMediaTags(ctx context.Context, fileRef blob.Ref) (map[stri
 
 func (c *corpusDB) GetWholeRef(ctx context.Context, fileRef blob.Ref) (wholeRef blob.Ref, ok bool) {
 	var s string
-	err := dbQueryRow(c.db, `SELECT wholeref FROM wholetofile WHERE fileref = ?`, fileRef.String()).Scan(&s)
+	err := dbQueryRow(ctx, c.db, `SELECT wholeref FROM wholetofile WHERE fileref = ?`, fileRef.String()).Scan(&s)
 	if err != nil {
 		return blob.Ref{}, false
 	}
@@ -758,11 +766,13 @@ func (c *corpusDB) GetWholeRef(ctx context.Context, fileRef blob.Ref) (wholeRef 
 }
 
 func (c *corpusDB) FileLatLong(fileRef blob.Ref) (lat, long float64, ok bool) {
-	wholeRef, ok := c.GetWholeRef(context.TODO(), fileRef)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wholeRef, ok := c.GetWholeRef(ctx, fileRef)
 	if !ok {
 		return 0, 0, false
 	}
-	err := dbQueryRow(c.db, `SELECT lat, long FROM exifgps WHERE wholeref = ?`, wholeRef.String()).Scan(&lat, &long)
+	err := dbQueryRow(ctx, c.db, `SELECT lat, long FROM exifgps WHERE wholeref = ?`, wholeRef.String()).Scan(&lat, &long)
 	if err != nil {
 		return 0, 0, false
 	}
@@ -770,12 +780,12 @@ func (c *corpusDB) FileLatLong(fileRef blob.Ref) (lat, long float64, ok bool) {
 }
 
 func (c *corpusDB) GetDirChildren(ctx context.Context, dirRef blob.Ref) (map[blob.Ref]struct{}, error) {
-	children, err := c.childRefs(`SELECT child FROM dirchildren WHERE parent = ?`, dirRef)
+	children, err := c.childRefs(ctx, `SELECT child FROM dirchildren WHERE parent = ?`, dirRef)
 	if err != nil {
 		return nil, err
 	}
 	if children == nil {
-		if _, ok, err := c.fileInfo(dirRef); err != nil {
+		if _, ok, err := c.fileInfo(ctx, dirRef); err != nil {
 			return nil, err
 		} else if !ok {
 			return nil, os.ErrNotExist
@@ -785,12 +795,14 @@ func (c *corpusDB) GetDirChildren(ctx context.Context, dirRef blob.Ref) (map[blo
 }
 
 func (c *corpusDB) GetParentDirs(ctx context.Context, childRef blob.Ref) (map[blob.Ref]struct{}, error) {
-	parents, err := c.childRefs(`SELECT parent FROM fileparents WHERE child = ?`, childRef)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	parents, err := c.childRefs(ctx, `SELECT parent FROM fileparents WHERE child = ?`, childRef)
 	if err != nil {
 		return nil, err
 	}
 	if parents == nil {
-		if _, ok, err := c.fileInfo(childRef); err != nil {
+		if _, ok, err := c.fileInfo(ctx, childRef); err != nil {
 			return nil, err
 		} else if !ok {
 			return nil, os.ErrNotExist
@@ -799,8 +811,8 @@ func (c *corpusDB) GetParentDirs(ctx context.Context, childRef blob.Ref) (map[bl
 	return parents, nil
 }
 
-func (c *corpusDB) childRefs(query string, br blob.Ref) (map[blob.Ref]struct{}, error) {
-	rows, err := dbQuery(c.db, query, br.String())
+func (c *corpusDB) childRefs(ctx context.Context, query string, br blob.Ref) (map[blob.Ref]struct{}, error) {
+	rows, err := dbQuery(ctx, c.db, query, br.String())
 	if err != nil {
 		return nil, err
 	}
@@ -820,7 +832,7 @@ func (c *corpusDB) childRefs(query string, br blob.Ref) (map[blob.Ref]struct{}, 
 }
 
 // claimsOf returns the claims of the permanode pn, sorted by date.
-func (c *corpusDB) claimsOf(pn blob.Ref) ([]camtypes.Claim, error) {
+func (c *corpusDB) claimsOf(ctx context.Context, pn blob.Ref) ([]camtypes.Claim, error) {
 	key := pn.String()
 	x, err := c.singleClaimsOf.Do(key, func() (any, error) {
 		if x, _ := c.claimsCache.Get(key); x != nil {
@@ -837,12 +849,12 @@ func (c *corpusDB) claimsOf(pn blob.Ref) ([]camtypes.Claim, error) {
 		// INNER JOIN claims B ON B.claimref = A.claimref
 		// WHERE A.permanode = ?
 		// ORDER BY B.date`,
-		tx, err := c.db.Begin()
+		tx, err := c.db.BeginTx(ctx, nil)
 		if err != nil {
 			return nil, err
 		}
 		defer tx.Rollback()
-		rows, err := dbQuery(tx, "SELECT claimref FROM claims_by_permanode_"+refPartition(pn)+" WHERE permanode = ?", key)
+		rows, err := dbQuery(ctx, tx, "SELECT claimref FROM claims_by_permanode_"+refPartition(pn)+" WHERE permanode = ?", key)
 		if err != nil {
 			return nil, err
 		}
@@ -876,7 +888,7 @@ func (c *corpusDB) claimsOf(pn blob.Ref) ([]camtypes.Claim, error) {
 			}
 			buf.WriteString(") ORDER BY date")
 			// fmt.Println(buf.String(), crs)
-			rows, err := dbQuery(tx, buf.String(), crs...)
+			rows, err := dbQuery(ctx, tx, buf.String(), crs...)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", buf.String(), err)
 			}
@@ -924,7 +936,7 @@ func scanClaim(row interface{ Scan(dest ...any) error }) (camtypes.Claim, error)
 func (c *corpusDB) AppendClaims(ctx context.Context, dst []camtypes.Claim, permaNode blob.Ref,
 	signerFilter string,
 	attrFilter string) ([]camtypes.Claim, error) {
-	claims, err := c.claimsOf(permaNode)
+	claims, err := c.claimsOf(ctx, permaNode)
 	if err != nil {
 		return dst, err
 	}
@@ -959,7 +971,9 @@ func (c *corpusDB) AppendPermanodeAttrValues(dst []string,
 	if len(dst) > 0 {
 		panic("len(dst) must be 0")
 	}
-	claims, err := c.claimsOf(permaNode)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claims, err := c.claimsOf(ctx, permaNode)
 	if err != nil || len(claims) == 0 {
 		return dst
 	}
@@ -1016,7 +1030,9 @@ func (c *corpusDB) PermanodeAttrValue(permaNode blob.Ref, attr string, at time.T
 }
 
 func (c *corpusDB) PermanodeHasAttrValue(pn blob.Ref, at time.Time, attr, val string) bool {
-	claims, err := c.claimsOf(pn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claims, err := c.claimsOf(ctx, pn)
 	if err != nil || len(claims) == 0 {
 		return false
 	}
@@ -1048,7 +1064,9 @@ func (c *corpusDB) PermanodeHasAttrValue(pn blob.Ref, at time.Time, attr, val st
 }
 
 func (c *corpusDB) ForeachClaim(permaNode blob.Ref, at time.Time, fn func(*camtypes.Claim) bool) {
-	claims, err := c.claimsOf(permaNode)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claims, err := c.claimsOf(ctx, permaNode)
 	if err != nil {
 		return
 	}
@@ -1063,7 +1081,9 @@ func (c *corpusDB) ForeachClaim(permaNode blob.Ref, at time.Time, fn func(*camty
 }
 
 func (c *corpusDB) ForeachClaimBack(value blob.Ref, at time.Time, fn func(*camtypes.Claim) bool) {
-	rows, err := dbQuery(c.db,
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rows, err := dbQuery(ctx, c.db,
 		`SELECT claimref, signerref, permanode, date, type, attr, value
 		FROM claims WHERE value = ? ORDER BY date, claimref`,
 		value.String())
@@ -1086,7 +1106,9 @@ func (c *corpusDB) ForeachClaimBack(value blob.Ref, at time.Time, fn func(*camty
 }
 
 func (c *corpusDB) PermanodeModtime(pn blob.Ref) (t time.Time, ok bool) {
-	claims, err := c.claimsOf(pn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claims, err := c.claimsOf(ctx, pn)
 	if err != nil || len(claims) == 0 {
 		return time.Time{}, false
 	}
@@ -1110,8 +1132,8 @@ func (c *corpusDB) pnTimeAttr(pn blob.Ref, attr string) (t time.Time, ok bool) {
 	return
 }
 
-func (c *corpusDB) pnCamliContent(pn blob.Ref) (cc blob.Ref, t time.Time, ok bool) {
-	claims, err := c.claimsOf(pn)
+func (c *corpusDB) pnCamliContent(ctx context.Context, pn blob.Ref) (cc blob.Ref, t time.Time, ok bool) {
+	claims, err := c.claimsOf(ctx, pn)
 	if err != nil {
 		return
 	}
@@ -1148,10 +1170,12 @@ func (c *corpusDB) PermanodeTime(pn blob.Ref) (t time.Time, ok bool) {
 	if t, ok = c.pnTimeAttr(pn, nodeattr.DateCreated); ok {
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var fi camtypes.FileInfo
-	ccRef, ccTime, ok := c.pnCamliContent(pn)
+	ccRef, ccTime, ok := c.pnCamliContent(ctx, pn)
 	if ok {
-		fi, _, _ = c.fileInfo(ccRef)
+		fi, _, _ = c.fileInfo(ctx, ccRef)
 	}
 	if fi.Time != nil {
 		return time.Time(*fi.Time), true
@@ -1180,7 +1204,9 @@ func (c *corpusDB) PermanodeAnyTime(pn blob.Ref) (t time.Time, ok bool) {
 
 func (c *corpusDB) PermanodeAttrsOrClaims(permaNode blob.Ref,
 	at time.Time, signerID string) (m map[string][]string, claims []*camtypes.Claim) {
-	claimsRaw, err := c.claimsOf(permaNode)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	claimsRaw, err := c.claimsOf(ctx, permaNode)
 	if err != nil || len(claimsRaw) == 0 {
 		return nil, nil
 	}
@@ -1230,9 +1256,9 @@ func (c *corpusDB) PermanodeAttrsOrClaims(permaNode blob.Ref,
 	return m, nil
 }
 
-func (c *corpusDB) listPermanodes(pnTime func(blob.Ref) (time.Time, bool), reverse bool) ([]pnAndTime, error) {
+func (c *corpusDB) listPermanodes(ctx context.Context, pnTime func(blob.Ref) (time.Time, bool), reverse bool) ([]pnAndTime, error) {
 	var pns []pnAndTime
-	rows, err := dbQuery(c.db, `SELECT DISTINCT permanode FROM claims_by_permanode`)
+	rows, err := dbQuery(ctx, c.db, `SELECT DISTINCT permanode FROM claims_by_permanode`)
 	if err != nil {
 		return nil, err
 	}
@@ -1274,7 +1300,9 @@ func (c *corpusDB) enumeratePermanodes(fn func(camtypes.BlobMeta) bool, pns []pn
 }
 
 func (c *corpusDB) EnumeratePermanodesLastModified(fn func(camtypes.BlobMeta) bool) {
-	pns, err := c.listPermanodes(c.PermanodeModtime, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pns, err := c.listPermanodes(ctx, c.PermanodeModtime, true)
 	if err != nil {
 		return
 	}
@@ -1282,7 +1310,9 @@ func (c *corpusDB) EnumeratePermanodesLastModified(fn func(camtypes.BlobMeta) bo
 }
 
 func (c *corpusDB) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, newestFirst bool) {
-	pns, err := c.listPermanodes(c.PermanodeAnyTime, newestFirst)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pns, err := c.listPermanodes(ctx, c.PermanodeAnyTime, newestFirst)
 	if err != nil {
 		return
 	}
@@ -1290,8 +1320,10 @@ func (c *corpusDB) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, n
 }
 
 func (c *corpusDB) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool, camliNodeTypes []string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for _, typ := range camliNodeTypes {
-		rows, err := dbQuery(c.db,
+		rows, err := dbQuery(ctx, c.db,
 			`SELECT DISTINCT permanode FROM claims WHERE attr = 'camliNodeType' AND permanode IS NOT NULL AND value = ?`,
 			typ)
 		if err != nil {
@@ -1317,11 +1349,13 @@ func (c *corpusDB) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) boo
 }
 
 func (c *corpusDB) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
-	c.enumerateBlobs(`SELECT ref, size, camlitype FROM blobs`, fn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.enumerateBlobs(ctx, `SELECT ref, size, camlitype FROM blobs`, fn)
 }
 
-func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool, args ...any) {
-	rows, err := dbQuery(c.db, query, args...)
+func (c *corpusDB) enumerateBlobs(ctx context.Context, query string, fn func(camtypes.BlobMeta) bool, args ...any) {
+	rows, err := dbQuery(ctx, c.db, query, args...)
 	if err != nil {
 		return
 	}
@@ -1343,13 +1377,15 @@ func (c *corpusDB) enumerateBlobs(query string, fn func(camtypes.BlobMeta) bool,
 }
 
 func (c *corpusDB) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.BlobMeta) bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if camType == "" {
-		c.enumerateBlobs(
+		c.enumerateBlobs(ctx,
 			`SELECT ref, size, camlitype FROM blobs WHERE camlitype != ''`,
 			fn)
 		return
 	}
-	c.enumerateBlobs(
+	c.enumerateBlobs(ctx,
 		`SELECT ref, size, camlitype FROM blobs WHERE camlitype = ?`,
 		fn, string(camType))
 }
@@ -1363,7 +1399,9 @@ func (c *corpusDB) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.
 
 func (c *corpusDB) IterPermanodes() iter.Seq[blob.Ref] {
 	return func(yield func(blob.Ref) bool) {
-		rows, err := dbQuery(c.db, `SELECT DISTINCT permanode FROM claims_by_permanode`)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		rows, err := dbQuery(ctx, c.db, `SELECT DISTINCT permanode FROM claims_by_permanode`)
 		if err != nil {
 			panic(err)
 		}
@@ -1489,13 +1527,14 @@ func refPartition(br blob.Ref) string {
 }
 
 func dbQuery(
+	ctx context.Context,
 	db interface {
-		Query(string, ...any) (*sql.Rows, error)
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	},
 	qry string, args ...any,
 ) (*sql.Rows, error) {
 	start := time.Now()
-	rows, err := db.Query(qry, args...)
+	rows, err := db.QueryContext(ctx, qry, args...)
 	if err != nil {
 		log.Printf("%s: %+v", qry, err)
 		return rows, err
@@ -1506,11 +1545,14 @@ func dbQuery(
 	return rows, nil
 }
 func dbQueryRow(
-	db interface{ QueryRow(string, ...any) *sql.Row },
+	ctx context.Context,
+	db interface {
+		QueryRowContext(context.Context, string, ...any) *sql.Row
+	},
 	qry string, args ...any,
 ) *sql.Row {
 	start := time.Now()
-	row := db.QueryRow(qry, args...)
+	row := db.QueryRowContext(ctx, qry, args...)
 	if dur := time.Since(start); dur > time.Second {
 		log.Printf("%s: %s", qry, time.Since(start))
 	}

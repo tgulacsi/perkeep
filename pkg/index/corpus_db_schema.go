@@ -17,6 +17,7 @@ limitations under the License.
 package index
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -37,14 +38,14 @@ const (
 // dbtx is the subset of database/sql used by the merge functions, and is
 // implemented by both *sql.DB and *sql.Tx.
 type dbtx interface {
-	Exec(query string, args ...any) (sql.Result, error)
-	Query(string, ...any) (*sql.Rows, error)
-	QueryRow(query string, args ...any) *sql.Row
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 // openDB opens (creating it if needed) the sqlite database at file, and
 // initializes its schema.
-func openDB(file string) (*sql.DB, error) {
+func openDB(file string) (*sql.Conn, error) {
 	db, err := sql.Open("sqlite", file)
 	if err != nil {
 		return nil, err
@@ -52,8 +53,11 @@ func openDB(file string) (*sql.DB, error) {
 	for _, s := range []string{
 		"journal_mode = WAL",
 		"synchronous = NORMAL",
-		"cache_size = -160000",
+		"cache_size = -65536",
+		"mmap_size = 8000000000",
 		"page_size = 16384",
+		"temp_store = MEMORY",
+		"threads = 4",
 		"optimize",
 	} {
 		if _, err := db.Exec("PRAGMA " + s); err != nil {
@@ -214,7 +218,12 @@ func openDB(file string) (*sql.DB, error) {
 			return nil, fmt.Errorf("schema version mismatch: have %v, want %v", version, requiredSchemaVersion)
 		}
 	}
-	return db, nil
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 const (
