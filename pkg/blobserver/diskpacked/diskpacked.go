@@ -394,6 +394,8 @@ func (s *storage) Close() error {
 }
 
 func (s *storage) Fetch(ctx context.Context, br blob.Ref) (io.ReadCloser, uint32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.fetch(br, 0, -1)
 }
 
