@@ -59,7 +59,7 @@ func newTempDiskpackedMemory(t *testing.T) blobserver.Storage {
 }
 
 func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) blobserver.Storage {
-	restoreLogging := test.TLog(t)
+	test.TLog(t)
 	dir, err := os.MkdirTemp("", "diskpacked-test")
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,6 @@ func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) blobserv
 		} else {
 			os.RemoveAll(dir)
 		}
-		restoreLogging()
 	})
 	return s
 }

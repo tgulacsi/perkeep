@@ -23,6 +23,7 @@ import (
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
 	"perkeep.org/pkg/types/camtypes"
+	"tailscale.com/util/set"
 )
 
 func ExpReverseTimeString(s string) string {
@@ -64,9 +65,9 @@ func (c *Corpus) Exp_AddKeyID(signerRef blob.Ref, signerID string) error {
 	})
 }
 
-func (x *Index) WithNeededMapsForTest(f func(needs, neededBy map[blob.Ref][]blob.Ref, ready map[blob.Ref]bool)) {
+func (x *Index) WithNeededMapsForTest(f func(needs, neededBy map[blob.Ref][]blob.Ref, ready set.Set[blob.Ref])) {
 	x.RLock()
-	f(x.needs, x.neededBy, x.readyReindex)
+	f(x.needs, x.neededBy, x.readyReindex.members)
 	x.RUnlock()
 }
 
@@ -82,22 +83,8 @@ func (x *Index) Exp_noteBlobIndexed(br blob.Ref) {
 	x.noteBlobIndexedLocked(br)
 }
 
-func (x *Index) Exp_AwaitReindexing(t *testing.T) {
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		x.RLock()
-		n := len(x.readyReindex)
-		x.RUnlock()
-		if n == 0 {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("timeout waiting for readyReindex to drain")
-}
-
 func (x *Index) Exp_AwaitAsyncIndexing(t *testing.T) {
-	x.reindexWg.Wait()
+	x.awaitReadyIdle()
 }
 
 type ExpPnAndTime pnAndTime

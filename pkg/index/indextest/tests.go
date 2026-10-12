@@ -42,6 +42,7 @@ import (
 	"perkeep.org/pkg/sorted"
 	"perkeep.org/pkg/test"
 	"perkeep.org/pkg/types/camtypes"
+	"tailscale.com/util/set"
 )
 
 var ctxbg = context.Background()
@@ -136,9 +137,10 @@ func (id *IndexDeps) NewPermanode() blob.Ref {
 	return id.uploadAndSign(unsigned)
 }
 
-// NewPlannedPermanode creates (& signs) a new planned permanode and adds it
-// to the index, returning its blobref.
-func (id *IndexDeps) NewPlannedPermanode(key string) blob.Ref {
+// NewDeterministicPermanodeForTest creates and signs a permanode with a fixed
+// key and adds it to the index, returning its blobref. The blobref is
+// deterministic for a given key, signer, and test clock time.
+func (id *IndexDeps) NewDeterministicPermanodeForTest(key string) blob.Ref {
 	unsigned := schema.NewPlannedPermanode(key)
 	return id.uploadAndSign(unsigned)
 }
@@ -1255,7 +1257,7 @@ func Reindex(t *testing.T, initIdx func() *index.Index) {
 	id.Fataler = t
 	defer id.DumpIndex(t)
 
-	pn1 := id.NewPlannedPermanode("foo1")
+	pn1 := id.NewDeterministicPermanodeForTest("foo1")
 	t.Logf("uploaded permanode %q", pn1)
 
 	// delete pn1
@@ -1316,10 +1318,10 @@ func checkEnumerate(idx *index.Index, want []blob.SizedRef, args *enumArgs) erro
 
 func checkStat(idx *index.Index, want []blob.SizedRef) error {
 	pos := make(map[blob.Ref]int) // wanted ref => its position in want
-	need := make(map[blob.Ref]bool)
+	need := make(set.Set[blob.Ref])
 	for i, sb := range want {
 		pos[sb.Ref] = i
-		need[sb.Ref] = true
+		need.Add(sb.Ref)
 	}
 
 	input := make([]blob.Ref, 0, len(want))
@@ -1334,10 +1336,10 @@ func checkStat(idx *index.Index, want []blob.SizedRef) error {
 		if !ok {
 			return fmt.Errorf("StatBlobs func called with unrequested ref %v (size %d)", sb.Ref, sb.Size)
 		}
-		if !need[sb.Ref] {
+		if !need.Contains(sb.Ref) {
 			return fmt.Errorf("StatBlobs func called with ref %v multiple times", sb.Ref)
 		}
-		delete(need, sb.Ref)
+		need.Delete(sb.Ref)
 		w := want[wantPos]
 		if sb != w {
 			return fmt.Errorf("StatBlobs returned %v; want %v", sb, w)
@@ -1365,7 +1367,7 @@ func EnumStat(t *testing.T, initIdx func() *index.Index) {
 
 	stepAdd := func(contents string) step { // add the blob
 		return func() error {
-			pn := id.NewPlannedPermanode(contents)
+			pn := id.NewDeterministicPermanodeForTest(contents)
 			t.Logf("uploaded permanode %q", pn)
 			added[contents] = pn
 			return nil

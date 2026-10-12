@@ -48,7 +48,7 @@ import (
 	"perkeep.org/pkg/blobserver"
 	"perkeep.org/pkg/jsonsign"
 	"perkeep.org/pkg/schema"
-	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 )
 
 func init() {
@@ -75,6 +75,11 @@ type mutationMap struct {
 	// TODO(mpl): we only need to keep track of one claim so far,
 	// but I chose a slice for when we need to do multi-claims?
 	deletes []schema.Claim
+
+	// deps are blobs that must be indexed before this blob can be
+	// fully indexed, discovered from the index rather than from a
+	// failed fetch (e.g. the target of a delete claim).
+	deps []blob.Ref
 }
 
 func (mm *mutationMap) Set(k, v string) {
@@ -119,98 +124,177 @@ func (ix *Index) indexBlob(ctx context.Context, br blob.Ref) error {
 	return nil
 }
 
-// indexReadyBlobs indexes blobs that have been recently marked as ready to be
-// reindexed, after the blobs they depend on eventually were indexed.
-func (ix *Index) indexReadyBlobs(ctx context.Context) {
-	defer ix.reindexWg.Done()
+// indexOp tracks dependency discovery during a ReceiveBlob call.
+type indexOp struct {
+	// indexed is the set of blobs that finished indexing while this
+	// op was in progress. ix.mu must be held to access it.
+	indexed set.Set[blob.Ref]
+}
 
-	popReadyReindex := func() (blob.Ref, bool) {
-		ix.Lock()
-		defer ix.Unlock()
-
-		if len(ix.readyReindex) == 0 {
-			return blob.Ref{}, false
-		}
-		var br blob.Ref
-		for br = range ix.readyReindex {
-			break
-		}
-		delete(ix.readyReindex, br)
-
-		return br, true
-	}
-
-	failed := make(map[blob.Ref]bool)
-	for {
-		br, ok := popReadyReindex()
-		if !ok {
-			break
-		}
-		if verboseReindex {
-			log.Printf("reindex: reindexing blob %v now that its dependencies are satisfied", br)
-		}
-		if err := ix.indexBlob(ctx, br); err != nil {
-			log.Printf("out-of-order indexBlob(%v) = %v", br, err)
-			failed[br] = true
-		}
-	}
-
+func (ix *Index) beginIndexOp() *indexOp {
+	op := new(indexOp)
 	ix.Lock()
 	defer ix.Unlock()
-	for br := range failed {
-		ix.readyReindex[br] = true
+	ix.inFlight.Make()
+	ix.inFlight.Add(op)
+	return op
+}
+
+func (ix *Index) endIndexOp(op *indexOp) {
+	ix.Lock()
+	defer ix.Unlock()
+	ix.inFlight.Delete(op)
+}
+
+// enqueueReadyLocked queues br to be indexed again now that the blobs
+// it depends on have been indexed, starting the worker that does so
+// if it's not already running.
+//
+// ix.mu must be held.
+func (ix *Index) enqueueReadyLocked(br blob.Ref) {
+	ix.readyReindex.Add(br)
+	if ix.readyWorkerDone == nil {
+		done := make(chan struct{})
+		ix.readyWorkerDone = done
+		go ix.indexReadyBlobs(done)
 	}
 }
 
-// noteBlobIndexed checks if the recent indexing of br now allows the blobs that
-// were depending on br, to be indexed in turn. If yes, they're reindexed
-// asynchronously by indexReadyBlobs.
+// indexReadyBlobs indexes the blobs in ix.readyReindex until it's empty,
+// then closes done and returns.
+func (ix *Index) indexReadyBlobs(done chan struct{}) {
+	ctx := context.Background()
+	for {
+		ix.Lock()
+		br, ok := ix.readyReindex.Pop()
+		if !ok {
+			ix.readyWorkerDone = nil
+			close(done)
+			ix.Unlock()
+			return
+		}
+		// Pop removes membership before indexing so br can be queued for
+		// another retry while it is being indexed.
+		ix.Unlock()
+
+		if verboseReindex {
+			log.Printf("reindex: reindexing blob %v now that its dependencies are satisfied", br)
+		}
+		err := ix.indexBlob(ctx, br)
+		if err != nil {
+			log.Printf("out-of-order indexBlob(%v) = %v", br, err)
+		}
+		ix.Lock()
+		if err != nil {
+			ix.readyFailed.Make()
+			ix.readyFailed.Add(br)
+		} else {
+			ix.readyFailed.Delete(br)
+		}
+		ix.Unlock()
+	}
+}
+
+// awaitReadyIdle waits until there are no blobs waiting to be indexed
+// by indexReadyBlobs.
+func (ix *Index) awaitReadyIdle() {
+	for {
+		ix.RLock()
+		done := ix.readyWorkerDone
+		ix.RUnlock()
+		if done == nil {
+			return
+		}
+		<-done
+	}
+}
+
+// noteBlobIndexedLocked records that br was just fully indexed, queueing
+// the blobs that were only waiting for br to be indexed again.
 //
 // ix.mu must be held.
 func (ix *Index) noteBlobIndexedLocked(br blob.Ref) {
+	for op := range ix.inFlight {
+		op.indexed.Make()
+		op.indexed.Add(br)
+	}
 	for _, needer := range ix.neededBy[br] {
 		newNeeds := blobsFilteringOut(ix.needs[needer], br)
 		if len(newNeeds) == 0 {
-			ix.readyReindex[needer] = true
 			delete(ix.needs, needer)
-			ix.reindexWg.Add(1)
-			go ix.indexReadyBlobs(context.Background())
+			ix.enqueueReadyLocked(needer)
 		} else {
 			ix.needs[needer] = newNeeds
 		}
 	}
 	delete(ix.neededBy, br)
-
-	mak.Set(&ix.recentDone, br, true)
 }
 
+// noteDepsLocked records that have, being indexed by op, can't be
+// fully indexed until deps are. Deps that were indexed while op was in
+// progress are skipped, as they were indexed too late for op to see
+// them but too early to wake have up. If no deps remain, have is queued
+// to be indexed again right away.
+//
+// ix.mu must be held.
+func (ix *Index) noteDepsLocked(op *indexOp, have blob.Ref, deps []blob.Ref) error {
+	for _, dep := range deps {
+		if op.indexed.Contains(dep) {
+			continue
+		}
+		if err := ix.noteNeededLocked(have, dep); err != nil {
+			return err
+		}
+	}
+	if len(ix.needs[have]) == 0 {
+		ix.enqueueReadyLocked(have)
+	}
+	return nil
+}
+
+// removeAllMissingEdges cleans up persisted dependencies after br is indexed.
+// ix.mu must be held, including while clearing hasMissing, so recording a new
+// edge cannot race with cleanup.
 func (ix *Index) removeAllMissingEdges(br blob.Ref) {
+	if !ix.hasMissing.Contains(br) {
+		return
+	}
 	var toDelete []string
 	it := ix.queryPrefix(keyMissing, br)
 	for it.Next() {
 		toDelete = append(toDelete, it.Key())
 	}
 	if err := it.Close(); err != nil {
-		// TODO: Care? Can lazily clean up later.
 		log.Printf("Iterator close error: %v", err)
+		return
 	}
-	for _, k := range toDelete {
-		if err := ix.s.Delete(k); err != nil {
-			log.Printf("Error deleting key %s: %v", k, err)
+	if len(toDelete) > 0 {
+		bm := ix.s.BeginBatch()
+		for _, k := range toDelete {
+			bm.Delete(k)
+		}
+		if err := ix.s.CommitBatch(bm); err != nil {
+			log.Printf("Error deleting missing edges for %v: %v", br, err)
+			return
 		}
 	}
+	ix.hasMissing.Delete(br)
 }
 
 func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Reader) (blob.SizedRef, error) {
-	pendVal, err := ix.getNewPendingBlobIndex(ctx, blobRef)
-	if err != nil {
-		return blob.SizedRef{}, err
-	}
-	defer func() { pendVal.MarkDone() }()
+	// Remember completions during the source read too. A replica may index a
+	// dependency before publishing its raw write; a later fetch can still miss it.
+	op := ix.beginIndexOp()
+	defer ix.endIndexOp(op)
 
-	// Read from source before acquiring ix.Lock (Issue 878):
+	// Do not hold ix.mu while reading from source (Issue 878).
 	sniffer := NewBlobSniffer(blobRef)
-	written, err := io.Copy(sniffer, source)
+	buf := getSnifferBuffer()
+	sniffer.contents = (*buf)[:0]
+	// SchemaBlob parsing owns its decoded data and JSON. Nothing in the
+	// mutation map or corpus retains this private sniffer's backing array.
+	defer func() { putSnifferBuffer(buf, sniffer.contents) }()
+	written, err := copyWithBuffer(sniffer, source)
 	if err != nil {
 		return blob.SizedRef{}, err
 	}
@@ -262,20 +346,13 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 		if len(fetcher.missing) == 0 {
 			panic("errMissingDep happened, but no fetcher.missing recorded")
 		}
-		allRecorded := true
-		for _, missing := range fetcher.missing {
-			if err := ix.noteNeededLocked(blobRef, missing); err != nil {
-				allRecorded = false
-			}
+		if noteErr := ix.noteDepsLocked(op, blobRef, fetcher.missing); noteErr != nil {
+			return blob.SizedRef{}, fmt.Errorf("%w; and recording its missing dependencies failed: %w", err, noteErr)
 		}
-		if allRecorded {
-			// Lie and say things are good. We've
-			// successfully recorded that the blob isn't
-			// indexed, but we'll reindex it later once
-			// the dependent blobs arrive.
-			return sbr, nil
-		}
-		return blob.SizedRef{}, err
+		// Lie and say things are good. We've successfully
+		// recorded that the blob isn't indexed, but we'll
+		// reindex it later once the dependent blobs arrive.
+		return sbr, nil
 	}
 
 	if err := ix.commit(mm); err != nil {
@@ -288,10 +365,17 @@ func (ix *Index) ReceiveBlob(ctx context.Context, blobRef blob.Ref, source io.Re
 		}
 	}
 
+	if len(mm.deps) > 0 {
+		// Partially indexed; mm says so in its "have:" row. As above,
+		// we'll reindex it once its dependencies are indexed.
+		if err := ix.noteDepsLocked(op, blobRef, mm.deps); err != nil {
+			return blob.SizedRef{}, err
+		}
+		return sbr, nil
+	}
+
 	ix.noteBlobIndexedLocked(blobRef)
 
-	// TODO(bradfitz): this removeAllMissingEdges need not hold ix.Lock
-	// and could be done in the background.
 	ix.removeAllMissingEdges(blobRef)
 
 	// TODO(bradfitz): log levels? These are generally noisy
@@ -398,9 +482,9 @@ func (ix *Index) populateMutationMap(ctx context.Context, fetcher *missTrackFetc
 	if len(fetcher.missing) == 0 {
 		// If err == nil, we're good. Else (err == errMissingDep), we
 		// know the error did not come from a fetching miss (because
-		// len(fetcher.missing) == 0) , but from an index miss. Therefore
-		// we know the miss has already been noted and will be dealt with
-		// later, so we can also pretend everything's fine.
+		// len(fetcher.missing) == 0), but from an index miss, which
+		// is in mm.deps for ReceiveBlob to note. So we can also
+		// pretend everything's fine.
 		return mm, nil
 	}
 	return mm, err
@@ -412,12 +496,35 @@ type keepFirstN struct {
 	Bytes []byte
 }
 
+func newKeepFirstN(n int, sizeHint int64) *keepFirstN {
+	return &keepFirstN{
+		N:     n,
+		Bytes: make([]byte, 0, max(0, min(int64(n), sizeHint))),
+	}
+}
+
 func (w *keepFirstN) Write(p []byte) (n int, err error) {
 	if n := w.N - len(w.Bytes); n > 0 {
 		if n > len(p) {
 			n = len(p)
 		}
 		w.Bytes = append(w.Bytes, p[:n]...)
+	}
+	return len(p), nil
+}
+
+// jpegAPP1Finder watches the entire file, not just its retained image prefix.
+// goexif searches raw bytes for FF E1, even past SOS or EOI. Only the absence
+// of that pair proves there is no APP1 section for it to decode.
+type jpegAPP1Finder struct {
+	found  bool
+	lastFF bool
+}
+
+func (w *jpegAPP1Finder) Write(p []byte) (int, error) {
+	if !w.found && len(p) != 0 {
+		w.found = (w.lastFF && p[0] == 0xe1) || bytes.Contains(p, []byte("\xff\xe1"))
+		w.lastFF = p[len(p)-1] == 0xff
 	}
 	return len(p), nil
 }
@@ -522,6 +629,9 @@ func (ix *Index) populateFile(ctx context.Context, fetcher blob.Fetcher, b *sche
 	}
 	defer fr.Close()
 	mimeType, mr := magic.MIMETypeFromReader(fr)
+	// Use the sniffed type, not the extension: a .jpg file could contain
+	// raw EXIF or TIFF, which does not need a JPEG APP1 marker.
+	isJPEG := mimeType == "image/jpeg"
 	if mimeType == "" {
 		mimeType = magic.MIMETypeByExtension(filepath.Ext(b.FileName()))
 	}
@@ -529,11 +639,18 @@ func (ix *Index) populateFile(ctx context.Context, fetcher blob.Fetcher, b *sche
 	h := blob.NewHash()
 	var copyDest io.Writer = h
 	var imageBuf *keepFirstN // or nil
+	var app1 jpegAPP1Finder
 	if strings.HasPrefix(mimeType, "image/") {
-		imageBuf = &keepFirstN{N: 512 << 10}
-		copyDest = io.MultiWriter(copyDest, imageBuf)
+		imageBuf = newKeepFirstN(512<<10, fr.Size())
+		if isJPEG {
+			copyDest = io.MultiWriter(copyDest, imageBuf, &app1)
+		} else {
+			copyDest = io.MultiWriter(copyDest, imageBuf)
+		}
 	}
-	size, err := io.Copy(copyDest, mr)
+	// MIME sniffing returns a MultiReader. Hide its WriterTo, which allocates
+	// fresh scratch even when io.CopyBuffer is given a reusable buffer.
+	size, err := copyWithBuffer(copyDest, struct{ io.Reader }{mr})
 	if err != nil {
 		if tf.allErrNotExist() {
 			return errMissingDep
@@ -541,6 +658,10 @@ func (ix *Index) populateFile(ctx context.Context, fetcher blob.Fetcher, b *sche
 		return err
 	}
 	wholeRef := blob.RefFromHash(h)
+	// The whole file was read for its hash. A truncated prefix alone cannot
+	// rule out EXIF. If the complete JPEG byte stream has no APP1 marker,
+	// avoid the two redundant scans and the otherwise fruitless full-file retry.
+	noEXIF := isJPEG && size == fr.Size() && !app1.found
 
 	if imageBuf != nil {
 		var conf images.Config
@@ -554,33 +675,35 @@ func (ix *Index) populateFile(ctx context.Context, fetcher blob.Fetcher, b *sche
 			log.Printf("index: WARNING: image decodeConfig: %v", err)
 		}
 
-		exifData := imageBuf.Bytes
-		if conf.HEICEXIF != nil {
-			exifData = conf.HEICEXIF
-		}
-		var ft time.Time
-		fileTime := func(r filePrefixReader) error {
-			ft, err = schema.FileTime(r)
-			return err
-		}
+		if !noEXIF {
+			exifData := imageBuf.Bytes
+			if conf.HEICEXIF != nil {
+				exifData = conf.HEICEXIF
+			}
+			var ft time.Time
+			fileTime := func(r filePrefixReader) error {
+				ft, err = schema.FileTime(r)
+				return err
+			}
 
-		if err = readPrefixOrFile(exifData, fetcher, b, fileTime); err == nil {
-			times = append(times, ft)
-		} else if debugEnv {
-			log.Printf("index: WARNING: image fileTime: %v", err)
+			if err = readPrefixOrFile(exifData, fetcher, b, fileTime); err == nil {
+				times = append(times, ft)
+			} else if debugEnv {
+				log.Printf("index: WARNING: image fileTime: %v", err)
 
-		}
-		if exifDebug {
-			log.Printf("filename %q exif = %v, %v", b.FileName(), ft, err)
-		}
-
-		// TODO(mpl): find (generate?) more broken EXIF images to experiment with.
-		indexEXIFData := func(r filePrefixReader) error {
-			return indexEXIF(wholeRef, r, mm)
-		}
-		if err = readPrefixOrFile(exifData, fetcher, b, indexEXIFData); err != nil {
+			}
 			if exifDebug {
-				log.Printf("error parsing EXIF: %v", err)
+				log.Printf("filename %q exif = %v, %v", b.FileName(), ft, err)
+			}
+
+			// TODO(mpl): find (generate?) more broken EXIF images to experiment with.
+			indexEXIFData := func(r filePrefixReader) error {
+				return indexEXIF(wholeRef, r, mm)
+			}
+			if err = readPrefixOrFile(exifData, fetcher, b, indexEXIFData); err != nil {
+				if exifDebug {
+					log.Printf("error parsing EXIF: %v", err)
+				}
 			}
 		}
 	}
@@ -862,9 +985,7 @@ func (ix *Index) populateDeleteClaim(ctx context.Context, cl schema.Claim, vr *j
 	meta, err := ix.GetBlobMeta(ctx, target)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if err := ix.noteNeeded(br, target); err != nil {
-				return fmt.Errorf("could not note that delete claim %v depends on %v: %w", br, target, err)
-			}
+			mm.deps = append(mm.deps, target)
 			return errMissingDep
 		}
 		log.Print(fmt.Errorf("Could not get mime type of target blob %v: %w", target, err))

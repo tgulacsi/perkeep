@@ -23,6 +23,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -38,6 +39,7 @@ import (
 	"perkeep.org/pkg/sorted"
 	"perkeep.org/pkg/test"
 	"perkeep.org/pkg/types/camtypes"
+	"tailscale.com/util/set"
 )
 
 var ctxbg = context.Background()
@@ -117,10 +119,16 @@ var (
 	// hence we do not want to check them.
 	notAnIndexer = []string{
 		"corpus_bench_test.go",
+		"corpus_blobmeta_test.go",
 		"corpus_test.go",
 		"export_test.go",
 		"index_test.go",
 		"keys_test.go",
+		"missing_cleanup_test.go",
+		"queue_set_test.go",
+		"ready_reindex_bench_test.go",
+		"receive_buffers_test.go",
+		"receive_exif_test.go",
 		"util_test.go",
 	}
 	// A map is used in hasAllRequiredTests to note which required
@@ -228,6 +236,31 @@ func TestMergeFileInfoRow(t *testing.T) {
 	testMergeFileInfoRow(t, "sha224-7032b0e01d39d3eac638f74512e19580212fc13bf846524d5eb6d1cb")
 }
 
+// TestDeletesSurviveReopen verifies that an Index opened on existing
+// storage knows about deletions recorded before it was opened.
+func TestDeletesSurviveReopen(t *testing.T) {
+	kv := sorted.NewMemoryKeyValue()
+	ix, err := index.New(kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := indextest.NewIndexDeps(ix)
+	id.Fataler = t
+	pn := id.NewPermanode()
+	id.Delete(pn)
+	if !ix.IsDeleted(pn) {
+		t.Fatalf("IsDeleted(%v) = false before reopen; want true", pn)
+	}
+
+	ix2, err := index.New(kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ix2.IsDeleted(pn) {
+		t.Errorf("IsDeleted(%v) = false after reopening index; want true", pn)
+	}
+}
+
 func TestInitNeededMaps(t *testing.T) {
 	s := sorted.NewMemoryKeyValue()
 
@@ -236,18 +269,19 @@ func TestInitNeededMaps(t *testing.T) {
 	s.Set(index.Exp_missingKey(fileBlobRef, chunk1ref), "1")
 	s.Set(index.Exp_missingKey(fileBlobRef, chunk2ref), "1")
 	s.Set(index.Exp_missingKey(fileBlobRef, chunk3ref), "1")
-	// Add fileBlob to the blobSource, so the out-of-order indexing can
-	// succeed when the chunk3ref is finally added to the index. We technically
-	// don't need to do that for this unit test, but that's one less log
-	// message to deal with (the ooo indexing failing) if we do.
+	// Add fileBlob and its chunks to the blobSource, so the out-of-order
+	// indexing can succeed when the chunk3ref is finally marked indexed.
 	bs := new(test.Fetcher)
 	bs.AddBlob(fileBlob)
+	bs.AddBlob(chunk1)
+	bs.AddBlob(chunk2)
+	bs.AddBlob(chunk3)
 	ix, err := index.New(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ix.InitBlobSource(bs)
-	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, _ map[blob.Ref]bool) {
+	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, _ set.Set[blob.Ref]) {
 		needsWant := map[blob.Ref][]blob.Ref{
 			fileBlobRef: {chunk2ref, chunk1ref, chunk3ref},
 		}
@@ -266,7 +300,7 @@ func TestInitNeededMaps(t *testing.T) {
 
 	ix.Exp_noteBlobIndexed(chunk2ref)
 
-	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, ready map[blob.Ref]bool) {
+	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, ready set.Set[blob.Ref]) {
 		needsWant := map[blob.Ref][]blob.Ref{
 			fileBlobRef: {chunk1ref, chunk3ref},
 		}
@@ -287,7 +321,7 @@ func TestInitNeededMaps(t *testing.T) {
 
 	ix.Exp_noteBlobIndexed(chunk1ref)
 
-	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, ready map[blob.Ref]bool) {
+	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, ready set.Set[blob.Ref]) {
 		needsWant := map[blob.Ref][]blob.Ref{
 			fileBlobRef: {chunk3ref},
 		}
@@ -307,7 +341,9 @@ func TestInitNeededMaps(t *testing.T) {
 
 	ix.Exp_noteBlobIndexed(chunk3ref)
 
-	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, ready map[blob.Ref]bool) {
+	ix.Exp_AwaitAsyncIndexing(t)
+
+	ix.WithNeededMapsForTest(func(needs, neededBy map[blob.Ref][]blob.Ref, ready set.Set[blob.Ref]) {
 		needsWant := map[blob.Ref][]blob.Ref{}
 		neededByWant := map[blob.Ref][]blob.Ref{}
 		if !reflect.DeepEqual(needs, needsWant) {
@@ -316,13 +352,18 @@ func TestInitNeededMaps(t *testing.T) {
 		if !reflect.DeepEqual(neededBy, neededByWant) {
 			t.Errorf("neededBy = %v; want %v", neededBy, neededByWant)
 		}
-		if !ready[fileBlobRef] {
-			t.Error("fileBlobRef not ready")
+		if len(ready) != 0 {
+			t.Errorf("ready = %v; want nothing", ready)
 		}
 	})
-	// We also technically don't need to wait for the ooo indexing goroutine
-	// to finish for this unit test, but it's cleaner.
-	ix.Exp_AwaitAsyncIndexing(t)
+	if got, err := s.Get("have:" + fileBlobRef.String()); err != nil || !strings.HasSuffix(got, "|indexed") {
+		t.Errorf("have:%v = %q, %v; want it indexed", fileBlobRef, got, err)
+	}
+	foreachSorted(t, s, func(k, v string) {
+		if strings.HasPrefix(k, "missing|") {
+			t.Errorf("Shouldn't have missing key: %q", k)
+		}
+	})
 	dumpSorted(t, s)
 }
 
@@ -427,6 +468,156 @@ func TestOutOfOrderIndexingDirectory(t *testing.T) {
 			wait: true,
 		},
 	})
+}
+
+// hookFetcher is a test.Fetcher that calls onMiss, once, the first time
+// a Fetch of missRef fails.
+type hookFetcher struct {
+	*test.Fetcher
+	missRef blob.Ref
+	onMiss  func()
+}
+
+func (f *hookFetcher) Fetch(ctx context.Context, br blob.Ref) (io.ReadCloser, uint32, error) {
+	rc, size, err := f.Fetcher.Fetch(ctx, br)
+	if br == f.missRef && errors.Is(err, os.ErrNotExist) && f.onMiss != nil {
+		onMiss := f.onMiss
+		f.onMiss = nil
+		onMiss()
+	}
+	return rc, size, err
+}
+
+// TestOutOfOrderIndexingDepArrivesMidIndex tests that a dependency
+// indexed after a blob fails to fetch it, but before that blob records
+// that it needs it, doesn't leave the blob waiting forever.
+func TestOutOfOrderIndexingDepArrivesMidIndex(t *testing.T) {
+	s := sorted.NewMemoryKeyValue()
+	ix, err := index.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tf := &hookFetcher{Fetcher: new(test.Fetcher), missRef: chunk3ref}
+	ix.InitBlobSource(tf)
+
+	add := func(b *test.Blob) {
+		t.Helper()
+		tf.AddBlob(b)
+		if _, err := ix.ReceiveBlob(ctxbg, b.BlobRef(), b.Reader()); err != nil {
+			t.Fatalf("ReceiveBlob(%v): %v", b.BlobRef(), err)
+		}
+	}
+	tf.onMiss = func() { add(chunk3) }
+
+	add(chunk1)
+	add(chunk2)
+	add(fileBlob)
+	ix.Exp_AwaitAsyncIndexing(t)
+
+	if got, err := s.Get("have:" + fileBlobRef.String()); err != nil || !strings.HasSuffix(got, "|indexed") {
+		t.Errorf("have:%v = %q, %v; want it indexed", fileBlobRef, got, err)
+	}
+	foreachSorted(t, s, func(k, v string) {
+		if strings.HasPrefix(k, "missing|") {
+			t.Errorf("Shouldn't have missing key: %q", k)
+		}
+	})
+}
+
+type firstReadHook struct {
+	io.Reader
+	hook func()
+}
+
+func (r *firstReadHook) Read(p []byte) (int, error) {
+	if hook := r.hook; hook != nil {
+		r.hook = nil
+		hook()
+	}
+	return r.Reader.Read(p)
+}
+
+// TestOutOfOrderIndexingDepArrivesWhileReading covers replica writes that finish
+// indexing a dependency before its raw-store write is visible. Its completion
+// must be remembered even if it occurs while the parent is still being read,
+// before the parent's first dependency lookup.
+func TestOutOfOrderIndexingDepArrivesWhileReading(t *testing.T) {
+	s := sorted.NewMemoryKeyValue()
+	ix, err := index.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ix.Close() })
+	tf := &hookFetcher{Fetcher: new(test.Fetcher), missRef: chunk3ref}
+	ix.InitBlobSource(tf)
+	for _, b := range []*test.Blob{chunk1, chunk2} {
+		tf.AddBlob(b)
+		if _, err := ix.ReceiveBlob(ctxbg, b.BlobRef(), b.Reader()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tf.AddBlob(fileBlob) // available for the background retry
+	tf.onMiss = func() {
+		// Publish the raw blob after the failed fetch, without another index
+		// completion notification. A replica's two writes can finish this way.
+		tf.AddBlob(chunk3)
+	}
+	r := &firstReadHook{
+		Reader: fileBlob.Reader(),
+		hook: func() {
+			// Index only: the raw-store write is not yet visible to Fetch.
+			if _, err := ix.ReceiveBlob(ctxbg, chunk3ref, chunk3.Reader()); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	if _, err := ix.ReceiveBlob(ctxbg, fileBlobRef, r); err != nil {
+		t.Fatal(err)
+	}
+	ix.Exp_AwaitAsyncIndexing(t)
+	if got, err := s.Get("have:" + fileBlobRef.String()); err != nil || !strings.HasSuffix(got, "|indexed") {
+		t.Errorf("have:%v = %q, %v; want it indexed", fileBlobRef, got, err)
+	}
+	foreachSorted(t, s, func(k, v string) {
+		if strings.HasPrefix(k, "missing|") {
+			t.Errorf("unexpected missing key after retry: %q", k)
+		}
+	})
+}
+
+// TestDeleteBeforeTargetSurvivesReopen tests that a delete claim indexed
+// before its target is applied once the target arrives, even if the
+// index was reopened in between.
+func TestDeleteBeforeTargetSurvivesReopen(t *testing.T) {
+	kv := sorted.NewMemoryKeyValue()
+	ix, err := index.New(kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := indextest.NewIndexDeps(ix)
+	id.Fataler = t
+
+	pn := id.Sign(schema.NewPlannedPermanode("target"))
+	del := schema.NewDeleteClaim(pn.BlobRef())
+	del.SetClaimDate(test.ClockOrigin)
+	id.Upload(id.Sign(del))
+	if ix.IsDeleted(pn.BlobRef()) {
+		t.Fatalf("IsDeleted(%v) = true before target was indexed", pn.BlobRef())
+	}
+
+	ix2, err := index.New(kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix2.KeyFetcher = ix.KeyFetcher
+	ix2.InitBlobSource(id.BlobSource)
+	id.Index = ix2
+	id.Upload(pn)
+	ix2.Exp_AwaitAsyncIndexing(t)
+
+	if !ix2.IsDeleted(pn.BlobRef()) {
+		t.Errorf("IsDeleted(%v) = false after target was indexed; want true", pn.BlobRef())
+	}
 }
 
 func TestIndexingPermanodeBadSignature(t *testing.T) {

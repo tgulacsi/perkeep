@@ -34,6 +34,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"perkeep.org/internal/hashutil"
@@ -125,6 +126,10 @@ type Client struct {
 	signerPublicKeyRef             blob.Ref
 	publicKeyArmored               string
 
+	// pubKeyUploaded is whether UploadPublicKey has made sure
+	// the server has the public key.
+	pubKeyUploaded atomic.Bool
+
 	statsMutex sync.Mutex
 	stats      Stats
 
@@ -148,12 +153,6 @@ type Client struct {
 	transportConfig *TransportConfig // or nil
 
 	noExtConfig bool // no external config; config file and env vars are ignored.
-
-	// sameOrigin indicates whether URLs in requests should be stripped from
-	// their scheme and HostPort parts. This is meant for when using the client
-	// through gopherjs in the web UI. Because we'll run into CORS errors if
-	// requests have a Host part.
-	sameOrigin bool
 }
 
 const maxParallelHTTP_h1 = 5
@@ -954,15 +953,6 @@ func (c *Client) blobPrefix() (string, error) {
 // discoRoot returns the user defined server for this client. It prepends "https://" if no scheme was specified.
 func (c *Client) discoRoot() string {
 	s := c.server
-	if c.sameOrigin {
-		s = strings.TrimPrefix(s, "http://")
-		s = strings.TrimPrefix(s, "https://")
-		parts := strings.SplitN(s, "/", 1)
-		if len(parts) < 2 {
-			return "/"
-		}
-		return "/" + parts[1]
-	}
 	if !strings.HasPrefix(s, "http") {
 		s = "https://" + s
 	}
@@ -1180,7 +1170,7 @@ func (c *Client) Sign(ctx context.Context, server string, r io.Reader) (signed [
 }
 
 func (c *Client) post(ctx context.Context, url string, bodyType string, body io.Reader) (*http.Response, error) {
-	if !c.sameOrigin && !strings.HasPrefix(url, c.discoRoot()) {
+	if !strings.HasPrefix(url, c.discoRoot()) {
 		return nil, fmt.Errorf("wrong URL (%q) for this server", url)
 	}
 	req := c.newRequest(ctx, "POST", url, body)
@@ -1396,18 +1386,24 @@ func (c *Client) signBlob(ctx context.Context, bb schema.Buildable, sigTime time
 
 // UploadPublicKey uploads the public key (if one is defined), so
 // subsequent (likely synchronous) indexing of uploaded signed blobs
-// will have access to the public key to verify it. In the normal
-// case, the stat cache prevents this from doing anything anyway.
+// will have access to the public key to verify it. The key is only
+// uploaded if the server doesn't already have it, and only checked
+// for once per Client.
 func (c *Client) UploadPublicKey(ctx context.Context) error {
+	if c.pubKeyUploaded.Load() {
+		return nil
+	}
 	sigRef := c.SignerPublicKeyBlobref()
 	if !sigRef.Valid() {
 		return nil
 	}
-	var err error
 	if _, keyUploaded := c.haveCache.StatBlobCache(sigRef); !keyUploaded {
-		_, err = c.uploadString(ctx, c.publicKeyArmored, false)
+		if _, err := c.uploadString(ctx, c.publicKeyArmored, true); err != nil {
+			return err
+		}
 	}
-	return err
+	c.pubKeyUploaded.Store(true)
+	return nil
 }
 
 // checkMatchingKeys compares the client's and the server's keys and logs if they differ.

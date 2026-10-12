@@ -68,6 +68,7 @@ type serverCmd struct {
 	mini        bool
 	publish     bool // whether to build and start the publisher app(s)
 	scancab     bool // whether to build and start the scancab app(s)
+	pdfcab      bool // whether to build and start the pdfcab app(s)
 	hello       bool // whether to build and start the hello demo app
 
 	openBrowser      bool
@@ -101,6 +102,7 @@ func init() {
 		flags.BoolVar(&cmd.sha1, "sha1", false, "Use sha1 instead of sha224.")
 		flags.BoolVar(&cmd.publish, "publish", true, "Enable publisher app(s)")
 		flags.BoolVar(&cmd.scancab, "scancab", false, "Enable scancab app(s)")
+		flags.BoolVar(&cmd.pdfcab, "pdfcab", false, "Enable pdfcab app(s)")
 		flags.BoolVar(&cmd.hello, "hello", false, "Enable hello (demo) app")
 		flags.BoolVar(&cmd.mini, "mini", false, "Enable minimal mode, where all optional features are disabled. (Currently just publishing)")
 
@@ -158,6 +160,7 @@ func (c *serverCmd) checkFlags(args []string) error {
 		}
 		c.publish = false
 		c.scancab = false
+		c.pdfcab = false
 		c.hello = false
 	}
 	if c.things && !c.wipe {
@@ -234,6 +237,7 @@ func (c *serverCmd) setEnvVars() error {
 
 	setenv("CAMLI_PUBLISH_ENABLED", strconv.FormatBool(c.publish))
 	setenv("CAMLI_SCANCAB_ENABLED", strconv.FormatBool(c.scancab))
+	setenv("CAMLI_PDFCAB_ENABLED", strconv.FormatBool(c.pdfcab))
 	setenv("CAMLI_HELLO_ENABLED", strconv.FormatBool(c.hello))
 	setenv("CAMLI_SHA1_ENABLED", strconv.FormatBool(c.sha1))
 	switch {
@@ -521,6 +525,7 @@ func (c *serverCmd) RunCommand(args []string) error {
 			targets = append(targets, "app/publisher")
 		}
 		targets = append(targets, "app/scanningcabinet")
+		targets = append(targets, "app/pdfcabinet")
 		err := build(targets...)
 		if err != nil {
 			return err
@@ -545,6 +550,11 @@ func (c *serverCmd) RunCommand(args []string) error {
 	}
 	if err := c.setFullClosure(); err != nil {
 		return fmt.Errorf("Could not setup the closure lib: %w", err)
+	}
+	// Git only records 0644 or 0755, but the encrypt storage
+	// refuses key files readable by others.
+	if err := os.Chmod(filepath.Join(camliSrcRoot, "config", "age.key"), 0600); err != nil {
+		return fmt.Errorf("Could not set permissions on the age key: %w", err)
 	}
 
 	log.Printf("Starting dev server on %v/ui/ with password \"pass3179\"\n",

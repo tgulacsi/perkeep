@@ -489,7 +489,6 @@ func DecodeConfig(r io.Reader) (Config, error) {
 	io.CopyN(io.Discard, tr, 1<<10)
 
 	mr := io.MultiReader(bytes.NewReader(buf.Bytes()), r)
-
 	mimeType := magic.MIMETypeFromReaderAt(bytes.NewReader(buf.Bytes()))
 	switch mimeType {
 	case "":
@@ -513,7 +512,9 @@ func DecodeConfig(r io.Reader) (Config, error) {
 		return decodeHEIFConfig(readerutil.NewBufferingReaderAt(mr))
 	}
 
-	conf, format, err := image.DecodeConfig(mr)
+	// Read through tr so that buf holds everything image.DecodeConfig
+	// consumes, keeping buf+r contiguous for the EXIF decoding below.
+	conf, format, err := image.DecodeConfig(io.MultiReader(bytes.NewReader(buf.Bytes()), tr))
 	if err != nil {
 		if debug {
 			log.Printf("internal/images: DecodeConfig failed after reading %d bytes for mime type %q: %v", buf.Len(), mimeType, err)

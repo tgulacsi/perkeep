@@ -34,7 +34,7 @@ var (
 )
 
 func BenchmarkCorpusFromStorage(b *testing.B) {
-	defer test.TLog(b)()
+	test.TLog(b)
 	buildKvOnce.Do(func() {
 		kvForBenchmark = sorted.NewMemoryKeyValue()
 		idx, err := index.New(kvForBenchmark)
@@ -45,7 +45,7 @@ func BenchmarkCorpusFromStorage(b *testing.B) {
 		id.Fataler = b
 		for i := range 10 {
 			fileRef, _ := id.UploadFile("file.txt", fmt.Sprintf("some file %d", i), time.Unix(1382073153, 0))
-			pn := id.NewPlannedPermanode(fmt.Sprint(i))
+			pn := id.NewDeterministicPermanodeForTest(fmt.Sprint(i))
 			id.SetAttribute(pn, "camliContent", fileRef.String())
 		}
 	})

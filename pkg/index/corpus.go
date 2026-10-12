@@ -40,6 +40,7 @@ import (
 
 	"go4.org/strutil"
 	"go4.org/syncutil"
+	"tailscale.com/util/set"
 )
 
 // Corpus is an in-memory summary of all of a user's blobs' metadata.
@@ -65,12 +66,12 @@ type Corpus struct {
 	brOfStr   map[string]blob.Ref // blob.Parse fast path
 	brInterns int64               // blob.Ref -> blob.Ref, via br method
 
-	blobs        map[blob.Ref]*camtypes.BlobMeta
+	blobs        map[blob.Ref]*corpusBlobMeta
 	sumBlobBytes int64
 
 	// camBlobs maps from camliType ("file") to blobref to the meta.
 	// The value is the same one in blobs.
-	camBlobs map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta
+	camBlobs map[schema.CamliType]map[blob.Ref]*corpusBlobMeta
 
 	// TODO: add GoLLRB to vendor; keep sorted BlobMeta
 	keyId signerFromBlobrefMap
@@ -113,8 +114,8 @@ type Corpus struct {
 
 	// permanodesSetByNodeType maps from a camliNodeType attribute
 	// value to the set of permanodes that ever had that
-	// value. The bool is always true.
-	permanodesSetByNodeType map[string]map[blob.Ref]bool
+	// value.
+	permanodesSetByNodeType map[string]set.Set[blob.Ref]
 
 	// scratch string slice
 	ss []string
@@ -306,8 +307,8 @@ func (pm *PermanodeMeta) valuesAtSigner(at time.Time,
 
 func newCorpus() *Corpus {
 	c := &Corpus{
-		blobs:                   make(map[blob.Ref]*camtypes.BlobMeta),
-		camBlobs:                make(map[schema.CamliType]map[blob.Ref]*camtypes.BlobMeta),
+		blobs:                   make(map[blob.Ref]*corpusBlobMeta),
+		camBlobs:                make(map[schema.CamliType]map[blob.Ref]*corpusBlobMeta),
 		files:                   make(map[blob.Ref]camtypes.FileInfo),
 		permanodes:              make(map[blob.Ref]*PermanodeMeta),
 		imageInfo:               make(map[blob.Ref]camtypes.ImageInfo),
@@ -320,7 +321,7 @@ func newCorpus() *Corpus {
 		mediaTags:               make(map[blob.Ref]map[string]string),
 		deletes:                 make(map[blob.Ref][]deletion),
 		claimBack:               make(map[blob.Ref][]*camtypes.Claim),
-		permanodesSetByNodeType: make(map[string]map[blob.Ref]bool),
+		permanodesSetByNodeType: make(map[string]set.Set[blob.Ref]),
 		dirChildren:             make(map[blob.Ref]map[blob.Ref]struct{}),
 		fileParents:             make(map[blob.Ref]map[blob.Ref]struct{}),
 	}
@@ -412,11 +413,11 @@ var slurpPrefixes = []string{
 }
 
 // Key types (without trailing punctuation) that we slurp to memory at start.
-var slurpedKeyType = make(map[string]bool)
+var slurpedKeyType = make(set.Set[string])
 
 func init() {
 	for _, prefix := range slurpPrefixes {
-		slurpedKeyType[typeOfKey(prefix)] = true
+		slurpedKeyType.Add(typeOfKey(prefix))
 	}
 }
 
@@ -605,7 +606,7 @@ func (c *Corpus) addBlob(ctx context.Context, br blob.Ref, mm *mutationMap) erro
 			// because we already took care of it in addKeyID
 			continue
 		}
-		if !slurpedKeyType[kt] {
+		if !slurpedKeyType.Contains(kt) {
 			continue
 		}
 		if err := corpusMergeFunc[kt](c, []byte(k), []byte(v)); err != nil {
@@ -654,17 +655,17 @@ func (c *Corpus) mergeBlobMeta(bm camtypes.BlobMeta) error {
 	if _, dup := c.blobs[bm.Ref]; dup {
 		panic("dup blob seen")
 	}
-	bm.CamliType = schema.CamliType((c.str(string(bm.CamliType))))
-
-	c.blobs[bm.Ref] = &bm
+	meta := newCorpusBlobMeta(bm)
+	c.blobs[bm.Ref] = meta
 	c.sumBlobBytes += int64(bm.Size)
 	if bm.CamliType != "" {
-		m, ok := c.camBlobs[bm.CamliType]
+		camliType := meta.camliType.Value()
+		m, ok := c.camBlobs[camliType]
 		if !ok {
-			m = make(map[blob.Ref]*camtypes.BlobMeta)
-			c.camBlobs[bm.CamliType] = m
+			m = make(map[blob.Ref]*corpusBlobMeta)
+			c.camBlobs[camliType] = m
 		}
-		m[bm.Ref] = &bm
+		m[bm.Ref] = meta
 	}
 	return nil
 }
@@ -703,12 +704,12 @@ func (c *Corpus) mergeClaimRow(k, v []byte) error {
 		c.claimBack[vbr] = append(c.claimBack[vbr], &cl)
 	}
 	if cl.Attr == "camliNodeType" {
-		set := c.permanodesSetByNodeType[cl.Value]
-		if set == nil {
-			set = make(map[blob.Ref]bool)
-			c.permanodesSetByNodeType[cl.Value] = set
+		nodes := c.permanodesSetByNodeType[cl.Value]
+		if nodes == nil {
+			nodes = make(set.Set[blob.Ref])
+			c.permanodesSetByNodeType[cl.Value] = nodes
 		}
-		set[pn] = true
+		nodes.Add(pn)
 	}
 	return nil
 }
@@ -953,7 +954,7 @@ func (c *Corpus) br(br blob.Ref) blob.Ref {
 func (c *Corpus) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.BlobMeta) bool) {
 	if camType != "" {
 		for _, bm := range c.camBlobs[camType] {
-			if !fn(*bm) {
+			if !fn(bm.blobMeta()) {
 				return
 			}
 		}
@@ -961,7 +962,7 @@ func (c *Corpus) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.
 	}
 	for _, m := range c.camBlobs {
 		for _, bm := range m {
-			if !fn(*bm) {
+			if !fn(bm.blobMeta()) {
 				return
 			}
 		}
@@ -973,7 +974,7 @@ func (c *Corpus) EnumerateCamliBlobs(camType schema.CamliType, fn func(camtypes.
 // If fn returns false, iteration ends.
 func (c *Corpus) EnumerateBlobMeta(fn func(camtypes.BlobMeta) bool) {
 	for _, bm := range c.blobs {
-		if !fn(*bm) {
+		if !fn(bm.blobMeta()) {
 			return
 		}
 	}
@@ -1072,7 +1073,7 @@ func (c *Corpus) enumeratePermanodes(fn func(camtypes.BlobMeta) bool, pns []pnAn
 		if bm == nil {
 			continue
 		}
-		if !fn(*bm) {
+		if !fn(bm.blobMeta()) {
 			return
 		}
 	}
@@ -1095,7 +1096,7 @@ func (c *Corpus) EnumeratePermanodesCreated(fn func(camtypes.BlobMeta) bool, new
 // EnumerateSingleBlob calls fn with br's BlobMeta if br exists in the corpus.
 func (c *Corpus) EnumerateSingleBlob(fn func(camtypes.BlobMeta) bool, br blob.Ref) {
 	if bm := c.blobs[br]; bm != nil {
-		fn(*bm)
+		fn(bm.blobMeta())
 	}
 }
 
@@ -1107,7 +1108,7 @@ func (c *Corpus) EnumeratePermanodesByNodeTypes(fn func(camtypes.BlobMeta) bool,
 		set := c.permanodesSetByNodeType[t]
 		for br := range set {
 			if bm := c.blobs[br]; bm != nil {
-				if !fn(*bm) {
+				if !fn(bm.blobMeta()) {
 					return
 				}
 			}
@@ -1120,7 +1121,7 @@ func (c *Corpus) GetBlobMeta(ctx context.Context, br blob.Ref) (camtypes.BlobMet
 	if !ok {
 		return camtypes.BlobMeta{}, os.ErrNotExist
 	}
-	return *bm, nil
+	return bm.blobMeta(), nil
 }
 
 func (c *Corpus) KeyId(ctx context.Context, signer blob.Ref) (string, error) {
